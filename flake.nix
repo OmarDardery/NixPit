@@ -39,6 +39,7 @@
       ];
     };
     checks.${system} = {
+    installer-recovery = import ./tests/installer-recovery.nix { inherit pkgs; };
     platform-paths = let
       config = self.nixosConfigurations.ci.config;
     in pkgs.runCommand "nixpit-platform-paths" {} ''
