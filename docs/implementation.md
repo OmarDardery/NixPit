@@ -16,6 +16,7 @@ Architecture and release criteria: [architecture.md](architecture.md). Execute i
 ## Evidence log
 
 - Foundation: prototype imported; architecture documented; auto-sync disabled; syntax checks available. Full NixOS build and integration gates are not yet verified.
+- G0 (in review, #3): inputs locked via git transport (nixpkgs `nixos-26.05`, NixVirt `v0.6.0`); Cockpit plugin `passthru.cockpitPath` fixed to a package list for nixos-26.05; `nix flake check` runs `javascript`, `installer` and `host-paths` (asserts cockpit.socket/libvirtd.service/podman.socket, no auto-sync unit, realised plugin manifests and runtime `git`); negative test: removing the plugin manifest fails `host-paths`. CI fails on missing or changed lock. Limitation: branch protection/required-check settings need repository admin access not available to the agent.
 - For each gate, add PR links, test commands/results, and any limitation. Do not change the definition of done to fit incomplete code.
 
 ## Required CI / release policy

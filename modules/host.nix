@@ -5,7 +5,8 @@ let
     pname = "cockpit-homelab";
     version = "4.0.0";
     src = ../cockpit;
-    passthru.cockpitPath = "/share/cockpit";
+    # Runtime dependencies exposed to Cockpit bridge processes (must be a package list).
+    passthru.cockpitPath = [ pkgs.git ];
     installPhase = ''
       mkdir -p $out/share/cockpit/homelab-gitops
       cp -r * $out/share/cockpit/homelab-gitops/

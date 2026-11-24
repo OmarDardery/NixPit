@@ -1,0 +1,51 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1795370043,
+        "narHash": "sha256-s/0jq8usZtLVOolYBwmyUmd3JsfAu7w3FU+a0dgMqSY=",
+        "ref": "nixos-26.05",
+        "rev": "0dc498bfe49baeb18b0f9891e800b53bb2603193",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/NixOS/nixpkgs"
+      },
+      "original": {
+        "ref": "nixos-26.05",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/NixOS/nixpkgs"
+      }
+    },
+    "nixvirt": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1748140003,
+        "narHash": "sha256-DNBZmuk1YRM2PmwbHzVdXumRjCUzQkMarg4iI/37rOQ=",
+        "ref": "refs/tags/v0.6.0",
+        "rev": "5dfe108fd859b122f9a96981cb6bc12297653d6c",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/AshleyYakeley/NixVirt"
+      },
+      "original": {
+        "ref": "refs/tags/v0.6.0",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/AshleyYakeley/NixVirt"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "nixvirt": "nixvirt"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
