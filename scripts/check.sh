@@ -16,4 +16,5 @@ if git ls-files | grep -E '(^|/)(\.env|[^/]+\.env|deploy_key|id_ed25519|id_rsa)$
   echo "Tracked runtime credential filename" >&2
   exit 1
 fi
+git ls-files --error-unmatch flake.lock >/dev/null || { echo "flake.lock must be committed" >&2; exit 1; }
 git diff --check
