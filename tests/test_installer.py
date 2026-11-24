@@ -61,5 +61,63 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(calls[-1], (old / "bin/switch-to-configuration", "test"))
 
 
+    def test_bootstrap_build_reinstall_and_failure(self):
+        from argparse import Namespace
+        from contextlib import ExitStack
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root, state, current, profile, system = (
+                base / name for name in ("root", "state", "current", "profile", "system")
+            )
+            current.mkdir()
+            profile.mkdir()
+            system.mkdir()
+            args = Namespace(source="github:a/b", static=None, gateway=None, dns=[])
+            calls = []
+
+            def fake_run(*cmd, **kwargs):
+                calls.append(cmd)
+                if cmd[:3] == ("nix", "flake", "lock"):
+                    path = Path(cmd[3].removeprefix("path:"))
+                    (path / "flake.lock").write_text("{}")
+                elif cmd[:2] == ("nix", "build"):
+                    link = cmd[cmd.index("--out-link") + 1]
+                    link.symlink_to(system)
+
+            with ExitStack() as stack:
+                for key, value in {"ROOT": root, "STATE": state, "ACTIVE": current,
+                                   "PROFILE": profile}.items():
+                    stack.enter_context(patch.object(installer, key, value))
+                stack.enter_context(patch.object(installer, "private_dir",
+                                                  side_effect=lambda p: p.mkdir(parents=True, exist_ok=True)))
+                stack.enter_context(patch.object(installer, "discover",
+                                                  return_value=("eth0", "192.168.1.20", "192.168.1.1", "00:00:00:00:00:01")))
+                stack.enter_context(patch.object(installer, "run", side_effect=fake_run))
+                stack.enter_context(patch.object(installer.subprocess, "run"))
+                activation = stack.enter_context(patch.object(installer, "activate"))
+                installer.bootstrap(args)
+                first = (root / "active").resolve()
+                self.assertEqual((first / "flake.lock").read_text(), "{}")
+                (state / "repos.json").write_text('[{"name":"preserve"}]')
+                (state / "secrets" / "keep.env").write_text("SECRET=test\n")
+                installer.bootstrap(args)
+                second = (root / "active").resolve()
+                self.assertNotEqual(first, second)
+                self.assertEqual((first / "flake.lock").read_bytes(),
+                                 (second / "flake.lock").read_bytes())
+                self.assertEqual(sum(c[:3] == ("nix", "flake", "lock") for c in calls), 1)
+                self.assertEqual((state / "repos.json").read_text(), '[{"name":"preserve"}]')
+                self.assertEqual((state / "secrets" / "keep.env").read_text(), "SECRET=test\n")
+
+                activation.side_effect = RuntimeError("injected activation failure")
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    installer.bootstrap(args)
+                self.assertEqual((root / "active").resolve(), second)
+                self.assertEqual((state / "hypervisor.flake").read_text(),
+                                 "path:/etc/nixpit/active#nixpit\n")
+                self.assertEqual((state / "repos.json").read_text(), '[{"name":"preserve"}]')
+
+
 if __name__ == "__main__":
     unittest.main()
