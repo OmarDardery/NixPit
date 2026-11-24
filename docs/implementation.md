@@ -21,3 +21,5 @@ Architecture and release criteria: [architecture.md](architecture.md). Execute i
 ## Required CI / release policy
 
 Static checks and full host evaluation/build are baseline. Add unit, schema, backend, NixOS VM and UI test jobs as implemented and make them required through the aggregate check. CI must never access real homelab credentials, modify live hosts, or run untrusted PR code with write tokens. A missing lock file is a release blocker. Use GitHub branch protection/rulesets to require PRs and the CI aggregate; repository settings need explicit setup and verification. No automatic release or merge of untrusted code.
+
+- G0 in progress (#3): CI now requires a tracked `flake.lock` and cannot generate one implicitly. Local `scripts/check.sh` passes. Locked Nix checks remain unverified: `nix` is absent, `/nix` does not exist, and the environment has no `sudo`. Attempting an isolated Nix runtime fails with `bwrap: setting up uid map: Read-only file system`. No gate is complete; resume by generating and checking the lock in a Nix-capable environment, then verify host/installer/plugin compatibility and required CI/settings before merging.
