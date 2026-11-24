@@ -17,7 +17,7 @@ ROOT = Path("/etc/nixpit")
 STATE = Path("/var/lib/nixpit")
 PROFILE = Path("/nix/var/nix/profiles/system")
 ACTIVE = Path("/run/current-system")
-SOURCE = re.compile(r"github:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_./-]+)?")
+SOURCE = re.compile(r"(?:github:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_./-]+)?|path:/nix/store/[0-9a-z]{32}-[A-Za-z0-9_.+-]+)")
 IFACE = re.compile(r"[A-Za-z0-9_.-]+")
 DEFAULT_SOURCE = "github:OmarDardery/NixPit"
 
@@ -43,7 +43,7 @@ def discover():
         raise ValueError("Unsupported interface name")
     addresses = query("ip", "-j", "-4", "addr", "show", "dev", iface)
     ip = next((a["local"] for d in addresses for a in d["addr_info"]
-               if a.get("scope") == "global"), None)
+               if a.get("scope") == "global" and a.get("family", "inet") == "inet"), None)
     if not ip:
         raise ValueError("No global IPv4 address on default interface")
     mac = (Path("/sys/class/net") / iface / "address").read_text().strip()
@@ -67,7 +67,7 @@ def validate_static(address, gateway, dns):
 def network_module(iface, static):
     if static is None:
         return "{ ... }: {}\n"
-    if not IFACE.fullmatch(iface):
+    if not IFACE.fullmatch(iface) or iface in (".", ".."):
         raise ValueError("Invalid interface")
     address, prefix, gateway, dns = static
     # Values are canonical IPv4 literals and a validated interface name.
@@ -112,7 +112,7 @@ def atomic_write(path, text):
 
 def wrapper(source):
     if not SOURCE.fullmatch(source):
-        raise ValueError("Expected a GitHub flake URI without a fragment")
+        raise ValueError("Expected a GitHub flake URI or immutable Nix store flake path")
     return (
         "{\n"
         f'  inputs.nixpit.url = "{source}";\n'
