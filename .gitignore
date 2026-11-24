@@ -1,0 +1,7 @@
+result
+result-*
+.env
+*.env
+!.env.example
+secrets/
+*.qcow2

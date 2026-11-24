@@ -1,0 +1,16 @@
+name: Prototype checks
+on: [push, pull_request]
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --check cockpit/app.js
+      - run: bash -n scripts/install.sh
+      - run: python -m json.tool cockpit/manifest.json > /dev/null && python -m json.tool templates/guests/guests.json > /dev/null
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check --show-trace

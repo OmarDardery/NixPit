@@ -1,0 +1,9 @@
+{
+  "version": 0,
+  "tools": {
+    "homelab-gitops": {
+      "label": "NixPit Workloads",
+      "path": "index.html"
+    }
+  }
+}
