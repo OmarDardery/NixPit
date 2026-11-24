@@ -1,5 +1,7 @@
 { pkgs, lib, ... }: {
   system.stateVersion = "25.11";
+  system.nixos.versionSuffix = lib.mkForce ".nixpit-test";
+  system.nixos.revision = lib.mkForce null;
   nixpkgs.hostPlatform = "x86_64-linux";
   nix.enable = true;
   nix.settings = {
@@ -13,10 +15,8 @@
   networking.useDHCP = false;
   networking.useNetworkd = false;
   networking.interfaces.eth0.useDHCP = false;
-  networking.interfaces.eth1.useDHCP = false;
-  networking.interfaces.eth1.ipv4.addresses = [{ address = "192.168.77.10"; prefixLength = 24; }];
-  networking.defaultGateway = { address = "192.168.77.1"; interface = "eth1"; };
-  networking.nameservers = [ "192.168.77.1" ];
+  networking.interfaces.eth1.useDHCP = true;
+  networking.interfaces.eth1.ipv4.addresses = [];
   services.openssh.enable = true;
   services.openssh.settings.PasswordAuthentication = true;
   users.users.admin = {
