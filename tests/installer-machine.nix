@@ -1,7 +1,7 @@
 { pkgs, lib, ... }: {
   system.stateVersion = "25.11";
-  system.nixos.versionSuffix = lib.mkForce ".nixpit-test";
-  system.nixos.revision = lib.mkForce null;
+  system.nixos.versionSuffix = lib.mkOverride 40 ".nixpit-test";
+  system.nixos.revision = lib.mkOverride 40 null;
   nix.enable = true;
   nix.settings = {
     experimental-features = [ "nix-command" "flakes" ];
