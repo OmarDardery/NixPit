@@ -1,5 +1,11 @@
 { pkgs, lib, ... }: {
   system.stateVersion = "25.11";
+  # Keep the VM driver console alive across candidate activation.
+  system.switch.enable = true;
+  systemd.services.backdoor = {
+    restartIfChanged = false;
+    stopIfChanged = false;
+  };
   system.nixos.versionSuffix = lib.mkOverride 40 ".nixpit-test";
   system.nixos.revision = lib.mkOverride 40 null;
   nix.enable = true;
