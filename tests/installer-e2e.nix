@@ -2,6 +2,7 @@
 
 let
   qemuModule = nixpkgs.outPath + "/nixos/modules/virtualisation/qemu-vm.nix";
+  testBase = nixpkgs.outPath + "/nixos/lib/testing/nixos-test-base.nix";
   baseModule = ./installer-machine.nix;
   # The offline source uses the same pinned inputs and the actual production module.
   # Only the transport changes: CI test guests have no internet.
@@ -23,7 +24,7 @@ let
     }
   '';
   hostConfig = pkgs.writeText "configuration.nix" ''
-    { ... }: { imports = [ ${qemuModule} ${baseModule} ]; }
+    { ... }: { imports = [ ${qemuModule} ${testBase} ${baseModule} ]; }
   '';
   staticModule = address: gateway: { lib, ... }: {
     networking.interfaces.eth1.useDHCP = lib.mkForce false;
@@ -33,7 +34,7 @@ let
   };
   candidate = network: (nixpkgs.lib.nixosSystem {
     system = "x86_64-linux";
-    modules = [ qemuModule baseModule self.nixosModules.default network ];
+    modules = [ qemuModule testBase baseModule self.nixosModules.default network ];
   }).config.system.build.toplevel;
   prepared = [
     (candidate {})
@@ -69,8 +70,10 @@ in pkgs.testers.runNixOSTest {
   testScript = ''
     import shlex
 
+    print("G1: boot DHCP peer")
     peer.start()
     peer.wait_for_unit("dnsmasq.service")
+    print("G1: boot target")
     machine.start()
     machine.wait_for_unit("sshd.service")
     machine.succeed("mkdir -p /etc/nixos; cp ${hostConfig} /etc/nixos/configuration.nix")
@@ -83,12 +86,16 @@ in pkgs.testers.runNixOSTest {
         peer.wait_until_succeeds(ssh(ip, command), timeout=180)
 
     install = "${installer}/bin/nixpit-install --yes"
+    print("G1: verify DHCP and remote login")
+    machine.succeed("ip -4 addr; ip -4 route")
     check("192.168.77.10", "sudo -n true")
+    print("G1: initial install")
     peer.succeed(ssh("192.168.77.10", install + " path:${source}"), timeout=900)
     check("192.168.77.10", "sudo -n test -e /etc/nixpit/active/flake.lock")
     check("192.168.77.10", "sudo -n systemctl is-active cockpit.socket")
     check("192.168.77.10", "sudo -n cmp /etc/nixos/configuration.nix ${hostConfig}")
     peer.succeed(ssh("192.168.77.10", "sudo -n sh -c 'printf fixture > /var/lib/nixpit/secrets/keep.env; chmod 600 /var/lib/nixpit/secrets/keep.env'"))
+    print("G1: reinstall")
     peer.succeed(ssh("192.168.77.10", install), timeout=900)
     check("192.168.77.10", "sudo -n grep -qx fixture /var/lib/nixpit/secrets/keep.env")
 
@@ -97,6 +104,7 @@ in pkgs.testers.runNixOSTest {
         script = install + " " + arguments + "; rc=$?; echo $rc > " + result + "; exit $rc"
         peer.succeed(ssh(ip, "sudo -n systemd-run --no-block --unit=" + unit + " /bin/sh -c " + shlex.quote(script)))
 
+    print("G1: successful static cutover")
     launch("192.168.77.10", "g1-good-cutover",
            "--static 192.168.77.20/24 --gateway 192.168.77.1 --dns 192.168.77.1",
            "/var/lib/nixpit/good-result")
@@ -104,6 +112,7 @@ in pkgs.testers.runNixOSTest {
     check("192.168.77.20", "sudo -n test -f /etc/nixpit/active/static.json")
     before = peer.succeed(ssh("192.168.77.20", "sudo -n readlink /etc/nixpit/active")).strip()
     before_system = peer.succeed(ssh("192.168.77.20", "readlink -f /run/current-system; readlink -f /nix/var/nix/profiles/system")).strip()
+    print("G1: failed static cutover and recovery")
     launch("192.168.77.20", "g1-bad-cutover",
            "--static 192.168.77.30/24 --gateway 192.168.77.254 --dns 192.168.77.1",
            "/var/lib/nixpit/bad-result")
