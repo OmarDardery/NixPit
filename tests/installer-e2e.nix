@@ -44,7 +44,7 @@ in pkgs.testers.runNixOSTest {
   name = "nixpit-installer-end-to-end";
   nodes.machine = { lib, ... }: {
     imports = [ baseModule ];
-    networking.interfaces.eth1.ipv4.addresses = lib.mkForce [{ address = "192.168.77.10"; prefixLength = 24; }];
+    networking.interfaces.eth1.ipv4.addresses = lib.mkForce [];
     virtualisation.vlans = [ 1 ];
     virtualisation.additionalPaths = [
       source hostConfig baseModule self.outPath nixpkgs.outPath nixvirt.outPath installer
@@ -53,14 +53,26 @@ in pkgs.testers.runNixOSTest {
   nodes.peer = { pkgs, lib, ... }: {
     virtualisation.vlans = [ 1 ];
     networking.interfaces.eth1.ipv4.addresses = lib.mkForce [{ address = "192.168.77.1"; prefixLength = 24; }];
+    networking.firewall.allowedUDPPorts = [ 67 ];
+    services.dnsmasq = {
+      enable = true;
+      settings = {
+        port = 0;
+        interface = "eth1";
+        bind-interfaces = true;
+        dhcp-range = "192.168.77.10,192.168.77.10,255.255.255.0,1h";
+        dhcp-option = [ "3,192.168.77.1" "6,192.168.77.1" ];
+      };
+    };
     environment.systemPackages = [ pkgs.sshpass pkgs.openssh ];
   };
   testScript = ''
     import shlex
 
-    start_all()
+    peer.start()
+    peer.wait_for_unit("dnsmasq.service")
+    machine.start()
     machine.wait_for_unit("sshd.service")
-    peer.wait_for_unit("multi-user.target")
     machine.succeed("mkdir -p /etc/nixos; cp ${hostConfig} /etc/nixos/configuration.nix")
     machine.succeed("nix-env --profile /nix/var/nix/profiles/system --set $(readlink -f /run/current-system)")
 
@@ -74,7 +86,7 @@ in pkgs.testers.runNixOSTest {
     check("192.168.77.10", "sudo -n true")
     peer.succeed(ssh("192.168.77.10", install + " path:${source}"), timeout=900)
     check("192.168.77.10", "sudo -n test -e /etc/nixpit/active/flake.lock")
-    check("192.168.77.10", "sudo -n systemctl is-active libvirtd.service")
+    check("192.168.77.10", "sudo -n systemctl is-active cockpit.socket")
     check("192.168.77.10", "sudo -n cmp /etc/nixos/configuration.nix ${hostConfig}")
     peer.succeed(ssh("192.168.77.10", "sudo -n sh -c 'printf fixture > /var/lib/nixpit/secrets/keep.env; chmod 600 /var/lib/nixpit/secrets/keep.env'"))
     peer.succeed(ssh("192.168.77.10", install), timeout=900)
@@ -91,12 +103,16 @@ in pkgs.testers.runNixOSTest {
     check("192.168.77.20", "sudo -n grep -qx 0 /var/lib/nixpit/good-result")
     check("192.168.77.20", "sudo -n test -f /etc/nixpit/active/static.json")
     before = peer.succeed(ssh("192.168.77.20", "sudo -n readlink /etc/nixpit/active")).strip()
+    before_system = peer.succeed(ssh("192.168.77.20", "readlink -f /run/current-system; readlink -f /nix/var/nix/profiles/system")).strip()
     launch("192.168.77.20", "g1-bad-cutover",
            "--static 192.168.77.30/24 --gateway 192.168.77.254 --dns 192.168.77.1",
            "/var/lib/nixpit/bad-result")
     check("192.168.77.20", "sudo -n grep -qx 1 /var/lib/nixpit/bad-result")
     after = peer.succeed(ssh("192.168.77.20", "sudo -n readlink /etc/nixpit/active")).strip()
     assert before == after, (before, after)
+    after_system = peer.succeed(ssh("192.168.77.20", "readlink -f /run/current-system; readlink -f /nix/var/nix/profiles/system")).strip()
+    assert before_system == after_system, (before_system, after_system)
+    check("192.168.77.20", "sudo -n journalctl -u nixpit-bootstrap --no-pager | grep -F 'Connectivity/SSH check failed'")
     check("192.168.77.20", "sudo -n grep -qx fixture /var/lib/nixpit/secrets/keep.env")
     check("192.168.77.20", "sudo -n cmp /etc/nixos/configuration.nix ${hostConfig}")
   '';
