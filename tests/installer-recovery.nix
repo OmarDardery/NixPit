@@ -7,6 +7,7 @@ pkgs.testers.runNixOSTest {
     services.openssh.enable = true;
     networking.firewall.allowedTCPPorts = [ 22 ];
     environment.systemPackages = [ pkgs.python3 ];
+    environment.etc."nixpit-test-installer.py".source = ../scripts/installer.py;
     virtualisation.writableStore = true;
     specialisation.candidate.configuration = {
       environment.etc."nixpit-candidate-marker".text = "candidate";
@@ -14,16 +15,18 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import textwrap
+
     machine.start()
     machine.wait_for_unit("sshd.service")
     machine.succeed("test ! -e /etc/nixpit-candidate-marker")
     machine.succeed("nix-env --profile /nix/var/nix/profiles/system --set $(readlink -f /run/current-system)")
-    machine.succeed("""
+    machine.succeed(textwrap.dedent("""
       python3 - <<'PY'
       import importlib.util
       from pathlib import Path
 
-      spec = importlib.util.spec_from_file_location("installer", "${../scripts/installer.py}")
+      spec = importlib.util.spec_from_file_location("installer", "/etc/nixpit-test-installer.py")
       installer = importlib.util.module_from_spec(spec)
       spec.loader.exec_module(installer)
       old = installer.ACTIVE.resolve(strict=True)
@@ -47,7 +50,7 @@ pkgs.testers.runNixOSTest {
       assert installer.PROFILE.resolve() == profile
       assert not marker.exists()
       PY
-    """)
+    """))
     machine.wait_for_unit("sshd.service")
     machine.succeed("test ! -e /etc/nixpit-candidate-marker")
   '';
