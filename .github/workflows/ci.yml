@@ -23,12 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: Resolve inputs (prototype only)
-        run: |
-          if [ ! -f flake.lock ]; then
-            echo "::warning::Missing committed flake.lock; release is blocked"
-            nix flake lock
-          fi
+      - name: Require committed dependency lock
+        run: git ls-files --error-unmatch flake.lock
       - name: Evaluate and check flake
         run: nix flake check --no-update-lock-file --show-trace
       - name: Evaluate full NixOS configuration
