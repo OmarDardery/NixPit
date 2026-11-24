@@ -2,7 +2,6 @@
   system.stateVersion = "25.11";
   system.nixos.versionSuffix = lib.mkForce ".nixpit-test";
   system.nixos.revision = lib.mkForce null;
-  nixpkgs.hostPlatform = "x86_64-linux";
   nix.enable = true;
   nix.settings = {
     experimental-features = [ "nix-command" "flakes" ];
