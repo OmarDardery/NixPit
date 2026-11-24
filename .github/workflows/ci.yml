@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@v32
       - name: Require committed dependency lock
         run: git ls-files --error-unmatch flake.lock
       - name: Evaluate and check flake
