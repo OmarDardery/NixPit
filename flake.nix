@@ -12,8 +12,12 @@
     pkgs = nixpkgs.legacyPackages.${system};
     installer = pkgs.writeShellApplication {
       name = "nixpit-install";
-      runtimeInputs = with pkgs; [ nix nixos-rebuild iproute2 jq coreutils gawk ];
-      text = builtins.readFile ./scripts/install.sh;
+      runtimeInputs = with pkgs; [ nix iproute2 coreutils python3 iputils systemd ];
+      text = ''
+        export NIXPIT_INSTALLER=${./scripts/installer.py}
+        export NIXPIT_DEFAULT_SOURCE="${if self ? rev then "github:OmarDardery/NixPit/${self.rev}" else "path:${self.outPath}"}"
+        ${builtins.readFile ./scripts/install.sh}
+      '';
     };
   in {
     apps.${system}.install = { type = "app"; program = "${installer}/bin/nixpit-install"; };
@@ -35,6 +39,8 @@
       ];
     };
     checks.${system} = {
+    installer-e2e = import ./tests/installer-e2e.nix { inherit pkgs nixpkgs nixvirt self installer; };
+    installer-recovery = import ./tests/installer-recovery.nix { inherit pkgs; };
     platform-paths = let
       config = self.nixosConfigurations.ci.config;
     in pkgs.runCommand "nixpit-platform-paths" {} ''

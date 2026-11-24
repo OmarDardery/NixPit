@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 node --check cockpit/app.js
 bash -n scripts/install.sh
 bash -n scripts/check.sh
+python3 -m unittest discover -s tests -p 'test_*.py'
 python3 - <<'PY'
 import json
 from pathlib import Path
