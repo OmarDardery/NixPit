@@ -18,7 +18,7 @@ On an existing x86_64 NixOS machine with flakes enabled and conventional `/etc/n
 nix run github:OmarDardery/NixPit#install
 ```
 
-The installer reports network details, preserves existing host configuration, creates a local wrapper flake, locks its inputs, builds and switches. Reserve the reported MAC/IP on your router. Existing flake-based hosts should instead import `nixosModules.default` into their existing flake and initialize the local state manually.
+The installer reports network details, preserves existing host configuration, builds a locked candidate, tests runtime activation before committing the boot profile, and attempts recovery on failure. DHCP/router reservation is the default. Experimental static IPv4 on conventional scripted networking: append `-- --static 192.168.1.20/24 --gateway 192.168.1.1 --dns 192.168.1.1` (use your real LAN values); the gateway must respond to ping. The detached `nixpit-bootstrap` systemd unit continues even if SSH disconnects; inspect `journalctl -u nixpit-bootstrap`. Reinstall reuses the existing locked source; legacy wrappers require manual migration. G1 remains unverified until disposable VM tests pass. Existing flake-based hosts should instead import `nixosModules.default` into their existing flake and initialize the local state manually.
 
 Open `https://<server-ip>:9090` on a trusted LAN, sign in as an existing administrator, then open **NixPit Workloads**. Generate a key, register a trusted workload repository, edit declarations and local secrets, review changes, validate, commit/push and deploy. The prototype's rollback switches the OS generation only; it does not restore Git or persistent data. Auto-sync is intentionally unavailable until transactional deployments are implemented.
 
