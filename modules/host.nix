@@ -5,7 +5,7 @@ let
     pname = "cockpit-homelab";
     version = "4.0.0";
     src = ../cockpit;
-    passthru.cockpitPath = "/share/cockpit";
+    passthru.cockpitPath = [];
     installPhase = ''
       mkdir -p $out/share/cockpit/homelab-gitops
       cp -r * $out/share/cockpit/homelab-gitops/

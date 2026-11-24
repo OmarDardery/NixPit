@@ -34,9 +34,23 @@
         }
       ];
     };
-    checks.${system}.javascript = pkgs.runCommand "nixpit-js-check" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    checks.${system} = {
+    platform-paths = let
+      config = self.nixosConfigurations.ci.config;
+    in pkgs.runCommand "nixpit-platform-paths" {} ''
+      test -x ${pkgs.podman-compose}/bin/podman-compose
+      test -r ${pkgs.blesh}/share/blesh/ble.sh
+      test -x ${pkgs.cockpit}/bin/cockpit-bridge
+      test -r ${pkgs.cockpit-machines}/share/cockpit/machines/manifest.json
+      test -r ${pkgs.cockpit-podman}/share/cockpit/podman/manifest.json
+      ${pkgs.lib.concatMapStringsSep "\n" (plugin:
+        "test -d ${plugin}/share/cockpit") config.services.cockpit.plugins}
+      touch $out
+    '';
+    javascript = pkgs.runCommand "nixpit-js-check" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
       node --check ${./cockpit/app.js}
       touch $out
     '';
+    };
   };
 }
