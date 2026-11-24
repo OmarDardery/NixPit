@@ -1,0 +1,23 @@
+name: Implementation gate
+description: Track a testable NixPit implementation slice
+title: "[Gx] "
+body:
+  - type: input
+    id: gate
+    attributes:
+      label: Gate / dependency
+      placeholder: G0
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and constraints
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance tests and failure cases
+    validations:
+      required: true

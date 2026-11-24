@@ -531,9 +531,22 @@ document.getElementById("btn-push").onclick = async () => {
   const dir = `${STATE}/repos/${repoSelectEl.value}`;
   const msg = document.getElementById("commit-msg").value.trim() || "Update guests via Cockpit";
   await run(["sh", "-c", `
+    set -eu
     cd "$1"
     if [ -n "$(git status --porcelain)" ]; then
-      git add -- guests.json compose.yaml docker-compose.yml Dockerfile 2>/dev/null || true
+      if ! git diff --cached --quiet; then
+        echo "Refusing to commit a pre-staged index. Review and unstage it first." >&2
+        exit 1
+      fi
+      for file in guests.json compose.yaml docker-compose.yml Dockerfile; do
+        if [ -L "$file" ]; then
+          echo "Refusing symlink: $file" >&2
+          exit 1
+        fi
+        if [ -f "$file" ] || git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+          git add -- "$file" || exit 1
+        fi
+      done
       git diff --cached --quiet || git commit -m "$2"
     else
       echo "No local changes to commit; pushing any unpushed commits..."
@@ -557,6 +570,7 @@ document.getElementById("btn-deploy").onclick = async () => {
 };
 
 document.getElementById("btn-rollback").onclick = async () => {
+  if (!confirm("Roll back the OS generation only? Git revisions and persistent data will not be restored.")) return;
   await run(["nixos-rebuild", "switch", "--rollback"]);
   renderGuestCards();
   refreshHealth();
@@ -565,14 +579,8 @@ document.getElementById("btn-rollback").onclick = async () => {
 // --- Auto-Sync Timer Toggle ---
 async function refreshAutoSync() {
   const btn = document.getElementById("btn-toggle-autosync");
-  const state = await getUnitState("homelab-autosync.timer");
-  const active = state === "active";
-  btn.textContent = active ? "Enabled (Disable)" : "Disabled (Enable)";
-  btn.className = active ? "success" : "";
-  btn.onclick = async () => {
-    await run(["systemctl", active ? "stop" : "start", "homelab-autosync.timer"]);
-    refreshAutoSync();
-  };
+  btn.textContent = "Unavailable — transactional sync required";
+  btn.disabled = true;
 }
 
 // Init

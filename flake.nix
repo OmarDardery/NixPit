@@ -22,6 +22,18 @@
       imports = [ nixvirt.nixosModules.default ./modules/host.nix ./modules/guest-loader.nix ];
       _module.args.nixvirt = nixvirt;
     };
+    # Evaluation fixture only: not a deployable host or a boot test.
+    nixosConfigurations.ci = nixpkgs.lib.nixosSystem {
+      inherit system;
+      modules = [
+        self.nixosModules.default
+        {
+          system.stateVersion = "25.11";
+          boot.loader.grub.enable = false;
+          fileSystems."/" = { device = "/dev/vda"; fsType = "ext4"; };
+        }
+      ];
+    };
     checks.${system}.javascript = pkgs.runCommand "nixpit-js-check" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
       node --check ${./cockpit/app.js}
       touch $out

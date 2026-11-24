@@ -1,16 +1,48 @@
-name: Prototype checks
-on: [push, pull_request]
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   static:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - run: node --check cockpit/app.js
-      - run: bash -n scripts/install.sh
-      - run: python -m json.tool cockpit/manifest.json > /dev/null && python -m json.tool templates/guests/guests.json > /dev/null
+      - name: Syntax and repository safety
+        run: bash scripts/check.sh
   nix:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - run: nix flake check --show-trace
+      - name: Resolve inputs (prototype only)
+        run: |
+          if [ ! -f flake.lock ]; then
+            echo "::warning::Missing committed flake.lock; release is blocked"
+            nix flake lock
+          fi
+      - name: Evaluate and check flake
+        run: nix flake check --no-update-lock-file --show-trace
+      - name: Evaluate full NixOS configuration
+        run: nix eval --no-update-lock-file .#nixosConfigurations.ci.config.system.build.toplevel.drvPath --show-trace
+      - name: Build installer
+        run: nix build --no-update-lock-file .#packages.x86_64-linux.default --print-build-logs
+  required:
+    if: ${{ always() }}
+    needs: [static, nix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both checks
+        env:
+          STATIC: ${{ needs.static.result }}
+          NIX: ${{ needs.nix.result }}
+        run: test "$STATIC" = success && test "$NIX" = success

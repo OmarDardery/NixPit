@@ -20,7 +20,7 @@ nix run github:OmarDardery/NixPit#install
 
 The installer reports network details, preserves existing host configuration, creates a local wrapper flake, locks its inputs, builds and switches. Reserve the reported MAC/IP on your router. Existing flake-based hosts should instead import `nixosModules.default` into their existing flake and initialize the local state manually.
 
-Open `https://<server-ip>:9090` on a trusted LAN, sign in as an existing administrator, then open **NixPit Workloads**. Generate a key, register a trusted workload repository, edit declarations and local secrets, review changes, validate, commit/push and deploy. The prototype's rollback switches the OS generation only; it does not restore Git or persistent data. Auto-sync is experimental and should remain off until transactional deployments are implemented.
+Open `https://<server-ip>:9090` on a trusted LAN, sign in as an existing administrator, then open **NixPit Workloads**. Generate a key, register a trusted workload repository, edit declarations and local secrets, review changes, validate, commit/push and deploy. The prototype's rollback switches the OS generation only; it does not restore Git or persistent data. Auto-sync is intentionally unavailable until transactional deployments are implemented.
 
 ## Repository layout
 
@@ -33,3 +33,7 @@ Open `https://<server-ip>:9090` on a trusted LAN, sign in as an existing adminis
 - `docs/architecture.md` — intended behavior, gaps and release gates
 
 The example printer and streaming stacks need hardware-specific configuration and trusted images; do not deploy them blindly.
+
+## Development
+
+Start with [AGENTS.md](AGENTS.md), then follow the ordered [implementation plan](docs/implementation.md). The [architecture](docs/architecture.md) defines release gates. CI failures are blockers; passing static checks alone is not production readiness.
