@@ -15,7 +15,7 @@
       runtimeInputs = with pkgs; [ nix iproute2 coreutils python3 iputils systemd ];
       text = ''
         export NIXPIT_INSTALLER=${./scripts/installer.py}
-        export NIXPIT_DEFAULT_SOURCE="github:OmarDardery/NixPit/${self.rev or "main"}"
+        export NIXPIT_DEFAULT_SOURCE="${if self ? rev then "github:OmarDardery/NixPit/${self.rev}" else "path:${self.outPath}"}"
         ${builtins.readFile ./scripts/install.sh}
       '';
     };
