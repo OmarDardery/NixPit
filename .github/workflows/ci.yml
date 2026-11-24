@@ -30,7 +30,20 @@ jobs:
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
       - name: Evaluate and check flake
-        run: nix flake check --no-update-lock-file --show-trace
+        run: nix flake check --no-update-lock-file --show-trace --print-build-logs
+      - name: Collect installer VM failure log
+        if: failure()
+        run: |
+          drv=$(nix eval --no-update-lock-file --raw .#checks.x86_64-linux.installer-e2e.drvPath) || exit 0
+          nix log "$drv" > installer-e2e.log 2>&1 || true
+          tail -n 300 installer-e2e.log
+      - name: Upload VM diagnostic log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-e2e-log
+          path: installer-e2e.log
+          if-no-files-found: ignore
       - name: Evaluate full NixOS configuration
         run: nix eval --no-update-lock-file .#nixosConfigurations.ci.config.system.build.toplevel.drvPath --show-trace
       - name: Build installer
