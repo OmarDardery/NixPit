@@ -12,8 +12,12 @@
     pkgs = nixpkgs.legacyPackages.${system};
     installer = pkgs.writeShellApplication {
       name = "nixpit-install";
-      runtimeInputs = with pkgs; [ nix nixos-rebuild iproute2 jq coreutils gawk ];
-      text = builtins.readFile ./scripts/install.sh;
+      runtimeInputs = with pkgs; [ nix iproute2 coreutils python3 iputils systemd sudo ];
+      text = ''
+        export NIXPIT_INSTALLER=${./scripts/installer.py}
+        export NIXPIT_DEFAULT_SOURCE="github:OmarDardery/NixPit/${self.rev or "main"}"
+        ${builtins.readFile ./scripts/install.sh}
+      '';
     };
   in {
     apps.${system}.install = { type = "app"; program = "${installer}/bin/nixpit-install"; };
