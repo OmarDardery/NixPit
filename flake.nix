@@ -39,6 +39,7 @@
       ];
     };
     checks.${system} = {
+    installer-e2e = import ./tests/installer-e2e.nix { inherit pkgs nixpkgs nixvirt self installer; };
     installer-recovery = import ./tests/installer-recovery.nix { inherit pkgs; };
     platform-paths = let
       config = self.nixosConfigurations.ci.config;
