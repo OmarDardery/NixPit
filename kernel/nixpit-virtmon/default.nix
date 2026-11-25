@@ -1,3 +1,6 @@
+# Nix derivation that compiles nixpit_virtmon.ko against the exact NixOS kernel headers.
+# Using kernel.moduleBuildDependencies and kernelModuleMakeFlags ensures matching GCC,
+# KBUILD_OUTPUT, and module signing/compression flags for the pinned kernel version.
 { lib, stdenv, kernel, kernelModuleMakeFlags ? kernel.commonMakeFlags }:
 
 stdenv.mkDerivation {

@@ -1,3 +1,10 @@
+# flake.nix — Top-level Nix flake for NixPit
+#
+# What: Declares pinned dependencies (nixpkgs, NixVirt, sops-nix) and exports the
+#       NixOS appliance module, installer, nixpit_virtmon.ko package, checks, and
+#       a disposable QEMU VM integration test (`packages.x86_64-linux.vm-test`).
+# Why:  Keeps kernel headers, packages, and tests reproducible via flake.lock.
+
 {
   description = "NixPit — declarative GitOps hypervisor appliance";
   inputs = {
@@ -16,6 +23,7 @@
     pkgs = nixpkgs.legacyPackages.${system};
     cli = import ./scripts/packages.nix { inherit pkgs; };
 
+    # Minimal NixOS evaluation fixture used by CI and to extract the target kernelPackages.
     ciSystem = nixpkgs.lib.nixosSystem {
       inherit system;
       modules = [
@@ -30,6 +38,8 @@
 
     virtmon = ciSystem.config.boot.kernelPackages.callPackage ./kernel/nixpit-virtmon { };
 
+    # Build a synthetic NixPit state directory containing containers, VMs, Compose, and
+    # a real SOPS-encrypted dotenv secret to test guest-loader.nix offline.
     fixtureState = pkgs.runCommand "nixpit-fixture-state" {
       nativeBuildInputs = [ pkgs.age pkgs.sops ];
     } ''
@@ -88,6 +98,7 @@ JSON
 YAML
     '';
 
+    # Helper to evaluate NixPit against a custom stateDir (for valid and invalid fixtures).
     mkFixtureSystem = stateDir: (nixpkgs.lib.nixosSystem {
       inherit system;
       modules = [
@@ -103,6 +114,7 @@ YAML
 
     fixtureCfg = mkFixtureSystem "${fixtureState}";
 
+    # Helper to construct invalid guests.json fixtures for fail-closed negative tests.
     mkBadState = name: jsonText: pkgs.runCommand "nixpit-bad-${name}" {} ''
       mkdir -p "$out/repos/bad"
       printf '[{"name":"bad","url":"https://github.com/example/bad.git"}]\n' > "$out/repos.json"
@@ -111,6 +123,7 @@ YAML
 JSON
     '';
 
+    # Ephemeral Age keypair + encrypted secret used inside the QEMU VM integration test.
     vmSopsFixture = pkgs.runCommand "nixpit-vm-sops-fixture" {
       nativeBuildInputs = [ pkgs.age pkgs.sops ];
     } ''
@@ -131,6 +144,9 @@ JSON
     packages.${system} = {
       default = cli.nixpit-install;
       inherit virtmon;
+
+      # Disposable NixOS QEMU VM test verifying nixpit_virtmon.ko, Libvirt/NixVirt,
+      # Cockpit plugin packaging, sops-nix, nixpit-secrets.service, and nixpit-repo.
       vm-test = pkgs.testers.runNixOSTest {
         name = "nixpit-virtualization-vm-test";
         nodes.machine = { lib, ... }: {
@@ -138,6 +154,7 @@ JSON
           virtualisation.memorySize = 2048;
           virtualisation.cores = 2;
 
+          # Seed the test Age private key before sops-nix's setupSecrets activation runs.
           system.activationScripts.seedVmAgeKey = lib.stringAfter [ ] ''
             install -d -m 0700 /var/lib/nixpit/sops/age
             cp ${vmSopsFixture}/keys.txt /var/lib/nixpit/sops/age/keys.txt
@@ -218,6 +235,7 @@ JSON
       };
     };
 
+    # Combined NixOS module imported by real hosts and test fixtures.
     nixosModules.default = { ... }: {
       imports = [
         nixvirt.nixosModules.default
@@ -231,6 +249,7 @@ JSON
     nixosConfigurations.ci = ciSystem;
 
     checks.${system} = {
+      # Verify all platform binaries, Cockpit plugins, and nixpit_virtmon.ko exist in the build.
       platform-paths = let
         config = ciSystem.config;
       in pkgs.runCommand "nixpit-platform-paths" {} ''
@@ -253,12 +272,14 @@ JSON
         touch $out
       '';
 
+      # Verify JS syntax of both Cockpit panels with Node.js.
       javascript = pkgs.runCommand "nixpit-js-check" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
         node --check ${./cockpit/app.js}
         node --check ${./cockpit/virtmon/app.js}
         touch $out
       '';
 
+      # Verify nixpit_virtmon.ko compiles cleanly and exposes GPL license + kernel vermagic.
       virtmon-ko = pkgs.runCommand "nixpit-virtmon-ko-check" {
         nativeBuildInputs = [ pkgs.kmod pkgs.xz pkgs.zstd ];
       } ''
@@ -276,6 +297,7 @@ JSON
         touch $out
       '';
 
+      # Run sandboxed end-to-end tests on nixpit-repo and nixpit-secrets CLIs.
       cli-tests = pkgs.runCommand "nixpit-cli-tests" {
         nativeBuildInputs = [ pkgs.git pkgs.openssh pkgs.jq pkgs.sops pkgs.age ];
       } ''
@@ -314,6 +336,7 @@ JSON
         touch $out
       '';
 
+      # Verify guest-loader.nix outputs valid firewall, Caddy, sops-nix, and xmllint-clean VM XMLs.
       guest-loader-eval = let
         domains = fixtureCfg.virtualisation.libvirt.connections."qemu:///system".domains;
         networks = fixtureCfg.virtualisation.libvirt.connections."qemu:///system".networks;
@@ -358,6 +381,7 @@ JSON
           touch $out
         '';
 
+      # Verify guest-loader.nix fails closed on duplicate domains/ports, bad UUIDs, and traversal.
       guest-loader-failures = let
         evalRejects = stateDir:
           let

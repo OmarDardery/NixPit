@@ -1,3 +1,17 @@
+/*
+ * nixpit_virtmon.c — NixPit Kernel Virtualization Activity Monitor
+ *
+ * What: Out-of-tree Linux kernel module (.ko) that detects CPU virtualization
+ *       extensions (Intel VT-x / AMD-V) and records virtualization-related OS
+ *       events (module loads, virtual NICs, /dev/kvm & /dev/vfio opens, and
+ *       hypervisor/container process launches) in a bounded ring buffer.
+ * How:  Registers kernel module/netdevice notifiers and two kprobes (vfs_open,
+ *       security_bprm_check), storing events under a spinlock and exposing
+ *       JSON/NDJSON status, events, and root-only control via /proc/nixpit_virtmon/.
+ * Why:  Provides a unified Ring-0 telemetry feed for Cockpit and dmesg without
+ *       needing an extra userspace daemon or altering hypervisor binaries.
+ */
+
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/module.h>
@@ -31,6 +45,7 @@ MODULE_VERSION("1.0.0");
 #define VIRTMON_VERSION "1.0.0"
 #define VIRTMON_RING_SIZE 512
 
+/* Event category IDs stored compactly as u8 in each ring-buffer slot. */
 enum virtmon_cat {
 	CAT_SYSTEM = 0,
 	CAT_KVM,
@@ -44,6 +59,7 @@ static const char *const cat_names[CAT_COUNT] = {
 	"system", "kvm", "module", "network", "process",
 };
 
+/* Fixed-size event record to avoid kmalloc inside atomic probe contexts. */
 struct virtmon_event {
 	u64 seq;
 	s64 ts_sec;
@@ -55,6 +71,11 @@ struct virtmon_event {
 	char message[160];
 };
 
+/*
+ * Bounded 512-entry circular buffer protected by ring_lock.
+ * Using spin_lock_irqsave (instead of mutex) is mandatory because kprobes and
+ * netdev notifiers can run in atomic/softirq context where sleeping is illegal.
+ */
 static struct virtmon_event ring_buf[VIRTMON_RING_SIZE];
 static DEFINE_SPINLOCK(ring_lock);
 static unsigned int ring_head;
@@ -68,6 +89,11 @@ static bool cpu_vmx, cpu_svm, cpu_hypervisor;
 static bool mod_nb_on, net_nb_on, open_kp_on, exec_kp_on;
 static struct proc_dir_entry *proc_dir;
 
+/*
+ * str_in_list - Check if `s` exactly matches any string in `list`.
+ * How: Linear scan over a small compile-time array with strcmp.
+ * Why: Shared by module-name and binary-name filters to avoid duplicate loops.
+ */
 static bool str_in_list(const char *s, const char *const *list, size_t n)
 {
 	size_t i;
@@ -81,6 +107,11 @@ static bool str_in_list(const char *s, const char *const *list, size_t n)
 	return false;
 }
 
+/*
+ * prefix_in_list - Check if `s` starts with any prefix in `list`.
+ * How: Linear scan using strncmp against each prefix's length.
+ * Why: Virtual NIC names include instance suffixes (e.g. virbr0, vnet1, vethA1).
+ */
 static bool prefix_in_list(const char *s, const char *const *list, size_t n)
 {
 	size_t i;
@@ -94,6 +125,14 @@ static bool prefix_in_list(const char *s, const char *const *list, size_t n)
 	return false;
 }
 
+/*
+ * virtmon_record - Append a virtualization event to the ring buffer and dmesg.
+ * How: Captures wall-clock timestamp and current task PID/comm, formats the
+ *      message on the stack, then inserts into ring_buf under spin_lock_irqsave
+ *      (overwriting the oldest slot when full). Prints via printk_ratelimited.
+ * Why: Keeps critical section tiny, bounded in memory, safe in atomic context,
+ *      and immune to dmesg log-flooding.
+ */
 static void virtmon_record(enum virtmon_cat cat, bool notice, const char *fmt, ...)
 {
 	struct virtmon_event ev;
@@ -137,6 +176,12 @@ static void virtmon_record(enum virtmon_cat cat, bool notice, const char *fmt, .
 			   ev.pid, ev.comm, ev.message);
 }
 
+/*
+ * virtmon_module_cb - Kernel module lifecycle notifier callback.
+ * What: Records load (LIVE) and unload (GOING) events for virtualization modules.
+ * How: Registered with register_module_notifier(); ignores unrelated modules.
+ * Why: Tracks dynamic loading/unloading of KVM, vhost, VFIO, tun, and virtio.
+ */
 static int virtmon_module_cb(struct notifier_block *nb, unsigned long val, void *data)
 {
 	static const char *const mods[] = {
@@ -161,6 +206,13 @@ static int virtmon_module_cb(struct notifier_block *nb, unsigned long val, void 
 
 static struct notifier_block virtmon_module_nb = { .notifier_call = virtmon_module_cb };
 
+/*
+ * virtmon_netdev_cb - Virtual network interface state notifier callback.
+ * What: Logs creation, destruction, link-up, and link-down for virtual NICs.
+ * How: Extracts struct net_device via netdev_notifier_info_to_dev() and filters
+ *      interface names by virtual bridge/tap/container prefixes.
+ * Why: Surfaces VM bridge (virbr/vnet) and container (podman/veth) churn.
+ */
 static int virtmon_netdev_cb(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	static const char *const prefixes[] = {
@@ -188,6 +240,14 @@ static int virtmon_netdev_cb(struct notifier_block *nb, unsigned long event, voi
 static struct notifier_block virtmon_netdev_nb = { .notifier_call = virtmon_netdev_cb };
 
 #if defined(CONFIG_KPROBES) && defined(CONFIG_X86_64)
+/*
+ * vfs_open_pre - Kprobe pre-handler on vfs_open(const struct path *path, ...).
+ * What: Detects any process opening /dev/kvm, /dev/vhost-*, /dev/net/tun, or /dev/vfio/*.
+ * How: Under x86_64 System V ABI, the 1st argument (path) sits in regs->di.
+ *      Verifies S_ISCHR() on the inode, then inspects dentry and parent names.
+ * Why: Checking S_ISCHR() avoids false positives on non-device paths like
+ *      /sys/module/kvm directories, and catches unprivileged/manual KVM usage.
+ */
 static int vfs_open_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->di;
@@ -216,6 +276,13 @@ static int vfs_open_pre(struct kprobe *p, struct pt_regs *regs)
 
 static struct kprobe vfs_open_kp = { .symbol_name = "vfs_open", .pre_handler = vfs_open_pre };
 
+/*
+ * exec_pre - Kprobe pre-handler on security_bprm_check(struct linux_binprm *bprm).
+ * What: Logs launches of QEMU, Libvirt, Podman, OCI runtimes, swtpm, and virtiofsd.
+ * How: Reads bprm from regs->di, extracts the filename basename, and matches
+ *      against qemu-system-* or the known virtualization binary list.
+ * Why: Hooks execve() in kernel space without needing auditd or ptrace.
+ */
 static int exec_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	static const char *const bins[] = {
@@ -239,6 +306,12 @@ static int exec_pre(struct kprobe *p, struct pt_regs *regs)
 static struct kprobe exec_kp = { .symbol_name = "security_bprm_check", .pre_handler = exec_pre };
 #endif
 
+/*
+ * seq_json_str - Emit a JSON-escaped string into a procfs seq_file buffer.
+ * How: Escapes quotes, backslashes, and ASCII control bytes (< 0x20).
+ * Why: Process names and paths can contain arbitrary bytes; escaping guarantees
+ *      /proc/nixpit_virtmon/events always outputs valid NDJSON.
+ */
 static void seq_json_str(struct seq_file *m, const char *s)
 {
 	const unsigned char *p = (const unsigned char *)(s ? s : "");
@@ -255,6 +328,11 @@ static void seq_json_str(struct seq_file *m, const char *s)
 	seq_putc(m, '"');
 }
 
+/*
+ * status_show - Render /proc/nixpit_virtmon/status as a single JSON object.
+ * How: Copies counters under ring_lock, drops the lock, then calls seq_printf().
+ * Why: seq_printf() may sleep/allocate, so it must run outside the spinlock.
+ */
 static int status_show(struct seq_file *m, void *v)
 {
 	unsigned long flags;
@@ -288,6 +366,12 @@ static int status_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/*
+ * events_show - Render /proc/nixpit_virtmon/events as NDJSON (oldest to newest).
+ * How: Allocates a temporary GFP_KERNEL snapshot buffer, copies ring_buf under
+ *      ring_lock, unlocks, formats each event as JSON via seq_file, then frees.
+ * Why: Prevents holding the spinlock during slow userspace seq_printf I/O.
+ */
 static int events_show(struct seq_file *m, void *v)
 {
 	struct virtmon_event *snap;
@@ -321,9 +405,18 @@ static int events_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/* Open callbacks binding /proc/nixpit_virtmon/{status,events} to seq_file. */
 static int status_open(struct inode *inode, struct file *file) { return single_open(file, status_show, NULL); }
 static int events_open(struct inode *inode, struct file *file) { return single_open(file, events_show, NULL); }
 
+/*
+ * control_write - Handle root writes to /proc/nixpit_virtmon/control.
+ * What: Accepts "clear" (resets ring buffer) or "probe" (logs snapshot event).
+ * How: Clamps input length, copies safely across user/kernel boundary with
+ *      copy_from_user(), trims whitespace, and executes under ring_lock.
+ * Why: Direct userspace pointer dereference would fault/violate SMAP; clamping
+ *      prevents kernel stack buffer overflow.
+ */
 static ssize_t control_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
 {
 	char buf[16];
@@ -368,6 +461,13 @@ static const struct proc_ops events_ops = {
 };
 static const struct proc_ops control_ops = { .proc_write = control_write };
 
+/*
+ * nixpit_virtmon_init - Module entry point called on insmod/modprobe.
+ * How: Reads CPUID virt flags, creates /proc/nixpit_virtmon/{status,events,control},
+ *      registers notifiers and kprobes, and records the initial startup event.
+ * Why: Cleanly rolls back /proc entries if creation fails, and keeps kprobe
+ *      failures non-fatal so status reporting still works on non-x86/restricted kernels.
+ */
 static int __init nixpit_virtmon_init(void)
 {
 #ifdef CONFIG_X86
@@ -397,6 +497,12 @@ static int __init nixpit_virtmon_init(void)
 	return 0;
 }
 
+/*
+ * nixpit_virtmon_exit - Module exit point called on rmmod.
+ * How: Unregisters kprobes, netdev notifier, and module notifier in reverse order
+ *      before recursively removing /proc/nixpit_virtmon.
+ * Why: Reverse teardown guarantees no callback fires into freed module memory.
+ */
 static void __exit nixpit_virtmon_exit(void)
 {
 #if defined(CONFIG_KPROBES) && defined(CONFIG_X86_64)

@@ -1,9 +1,23 @@
+# modules/host.nix — NixOS Hypervisor Platform Configuration
+#
+# What: Configures the base NixOS host with KVM/Libvirt virtualization, rootful
+#       Podman, Cockpit web UI (+ our custom plugins), the nixpit_virtmon.ko
+#       kernel module, and SOPS/Age secret decryption (sops-nix + nixpit-secrets).
+# How:  Declares NixOS options in a pure attrset (`config = { ... }`) so the
+#       NixOS module system builds systemd units, kernel modules, and firewall
+#       rules deterministically.
+# Why:  Separates the stable OS platform from dynamic workload repos loaded by
+#       modules/guest-loader.nix.
+
 { config, lib, pkgs, nixvirt, ... }:
 
 let
   cfg = config.services.nixpit;
   cli = import ../scripts/packages.nix { inherit pkgs; };
 
+  # Package a Cockpit web plugin directory into /share/cockpit/<dest>/ along with
+  # the shared Vercel dark stylesheet (cockpit/theme.css).
+  # passthru.cockpitPath = [] tells NixOS's services.cockpit module where to link it.
   mkCockpitPlugin = { pname, version, src, dest }: pkgs.stdenv.mkDerivation {
     inherit pname version src;
     passthru.cockpitPath = [];
@@ -28,18 +42,23 @@ let
     dest = "nixpit-virtmon";
   };
 
+  # Compile nixpit_virtmon.ko against the exact kernelPackages configured on this host.
   nixpit-virtmon = config.boot.kernelPackages.callPackage ../kernel/nixpit-virtmon { };
 in {
+  # Allow disabling the kernel monitor cleanly without removing the rest of NixPit.
   options.services.nixpit.virtmon.enable = lib.mkEnableOption "NixPit kernel virtualization monitor" // {
     default = true;
   };
 
+  # Optionally import static network config created during host bootstrap if present.
   imports = lib.optional (builtins.pathExists /var/lib/nixpit/network.nix) /var/lib/nixpit/network.nix;
 
   config = {
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
-    # Kernel Virtualization & Monitor Module (.ko)
+    # Build and auto-load KVM, vhost_net, tun, and our nixpit_virtmon.ko module at boot.
+    # Nested virtualization options are set for both Intel and AMD via modprobe.d rather
+    # than forcing kvm_intel/kvm_amd in boot.kernelModules (which fails on the other CPU).
     boot.extraModulePackages = lib.optional cfg.virtmon.enable nixpit-virtmon;
     boot.kernelModules = [
       "kvm"
@@ -51,7 +70,8 @@ in {
       options kvm_amd nested=1
     '';
 
-    # Virtualization Engines (KVM/QEMU/Libvirt via NixVirt + Rootful Podman)
+    # Enable KVM/Libvirt via NixVirt and declaratively provision the default NAT bridge
+    # network (virbr0, 192.168.122.0/24) and default directory pool (/var/lib/libvirt/images).
     virtualisation.libvirt = {
       enable = true;
       swtpm.enable = true;
@@ -81,6 +101,7 @@ in {
       };
     };
 
+    # Configure QEMU/KVM runtime: virtiofsd for shared host folders and SPICE USB redirection.
     virtualisation.libvirtd = {
       onBoot = "ignore";
       onShutdown = "shutdown";
@@ -92,15 +113,19 @@ in {
     };
 
     virtualisation.spiceUSBRedirection.enable = true;
+
+    # Rootful Podman with Docker CLI compatibility and container DNS enabled.
     virtualisation.podman = {
       enable = true;
       dockerCompat = true;
       defaultNetwork.settings.dns_enabled = true;
     };
 
+    # Trust virbr0 in the host firewall so VMs can get DHCP leases and DNS from dnsmasq.
     networking.firewall.trustedInterfaces = [ "virbr0" ];
 
-    # Shared Age identity for sops-nix and nixpit-secrets.service
+    # Configure sops-nix to use the single host Age identity (/var/lib/nixpit/sops/age/keys.txt).
+    # Keeping the literal path prevents Nix store-context errors when tests override cfg.stateDir.
     sops.age = {
       keyFile = lib.mkDefault "/var/lib/nixpit/sops/age/keys.txt";
       generateKey = lib.mkDefault true;
@@ -108,6 +133,7 @@ in {
     };
     sops.gnupg.sshKeyPaths = lib.mkDefault [];
 
+    # Create persistent directories for VM disks, encrypted secrets, and tmpfs runtime secrets.
     systemd.tmpfiles.rules = [
       "d /var/lib/libvirt/images 0711 root root -"
       "d ${cfg.stateDir}/sops 0700 root root -"
@@ -117,6 +143,7 @@ in {
       "d /run/nixpit/secrets 0700 root root -"
     ];
 
+    # Decrypt host-managed SOPS secrets into tmpfs (/run/nixpit/secrets) before containers start.
     systemd.services.nixpit-secrets = {
       description = "NixPit SOPS secret management service";
       wantedBy = [ "multi-user.target" ];
@@ -133,6 +160,7 @@ in {
       };
     };
 
+    # Enable Cockpit web control plane on port 9090 with VMs, Podman, and NixPit panels.
     services.cockpit = {
       enable = true;
       openFirewall = true;
@@ -155,6 +183,7 @@ in {
       };
     };
 
+    # Host CLI tools needed by Cockpit actions, Libvirt/QEMU, Podman Compose, and SOPS.
     environment.systemPackages = with pkgs; [
       cli.nixpit-repo
       cli.nixpit-secrets

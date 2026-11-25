@@ -1,3 +1,12 @@
+# modules/guest-loader.nix — Declarative Workload & SOPS Compiler
+#
+# What: Reads repos.json and each synced repository's guests.json / compose files
+#       and translates them into Podman containers, Libvirt VM XML domains, firewall
+#       rules, Caddy reverse proxies, tmpfiles directories, and sops-nix secrets.
+# How:  Validates all identifiers, ports, domains, UUIDs, USB IDs, and paths at
+#       Nix evaluation time (fail-closed via `throw`), then emits standard NixOS options.
+# Why:  Lets external workload Git repos stay plain JSON/Compose/SOPS without Nix syntax.
+
 { config, lib, pkgs, nixvirt, ... }:
 
 let
@@ -12,25 +21,31 @@ let
   domainRegex = "^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$";
   approvedMountRoots = [ "/var/lib/" "/srv/" "/mnt/" "/data/" ];
 
+  # Reject unsafe names (shell metacharacters, slashes, or leading dots) used in unit/file names.
   assertIdent = kind: value:
     if builtins.isString value && builtins.match identRegex value != null then value
     else throw "NixPit: invalid ${kind} identifier '${toString value}'";
 
+  # Reject empty paths or ".." traversal segments in volume/disk specifications.
   assertNoTraversal = kind: value:
     if builtins.isString value && value != "" && !(lib.hasInfix ".." value) then value
     else throw "NixPit: invalid ${kind} path '${toString value}'";
 
+  # Load registered repo names from repos.json (empty list before any profile is added).
   registry = "${stateDir}/repos.json";
   repoNames =
     if builtins.pathExists registry then
       map (r: assertIdent "repository" (r.name or "")) (builtins.fromJSON (builtins.readFile registry))
     else [];
 
+  # Read guests.json for each registered repository.
   loadedGuests = map (name:
     let jsonFile = "${reposDir}/${name}/guests.json";
     in { inherit name; data = if builtins.pathExists jsonFile then builtins.fromJSON (builtins.readFile jsonFile) else {}; }
   ) repoNames;
 
+  # Merge containers/vms across all repos, failing closed if two repos declare the same name.
+  # Tags each container with `_repo` so we know which repo owns `secrets/<secret>.sops.env`.
   mergeUnique = key:
     lib.foldl' (acc: entry:
       let
@@ -43,6 +58,7 @@ let
         else acc // next
     ) {} loadedGuests;
 
+  # Validate container fields and resolve whether SOPS secrets come from the repo or host.
   mergedContainers = lib.mapAttrs (name: c:
     let
       _name = assertIdent "container" name;
@@ -69,6 +85,7 @@ let
     }
   ) (mergeUnique "containers");
 
+  # Validate VM fields (UUID, positive CPU/RAM, disk path, network/bridge, USB vendor:product).
   mergedVms = lib.mapAttrs (name: vm:
     let
       _name = assertIdent "vm" name;
@@ -90,6 +107,8 @@ let
     }
   ) (mergeUnique "vms");
 
+  # Register repo-committed `secrets/<name>.sops.env` files with sops-nix so they decrypt
+  # into /run/secrets/nixpit/<name> (ramfs, mode 0400) at activation time.
   repoSopsSecrets = lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (_: c:
     lib.optional c._hasRepoSops {
       name = "nixpit/${c.secretName}";
@@ -102,6 +121,8 @@ let
     }
   ) mergedContainers));
 
+  # Parse `[hostIp:]hostPort:containerPort[/proto]` (including IPv6 brackets like `[::]:8443:443/tcp`).
+  # Distinguishes loopback bindings (127.0.0.1 / ::1) from public bindings that need firewall holes.
   parsePortSpec = containerName: rawSpec:
     let
       protoParts = lib.splitString "/" rawSpec;
@@ -132,6 +153,7 @@ let
     map (p: parsePortSpec name p // { container = name; }) (c.ports or [])
   ) mergedContainers));
 
+  # Fail closed if two containers try to publish the same host port+protocol.
   _uniquePublicPorts = lib.foldl' (seen: p:
     if builtins.hasAttr p.key seen then
       throw "NixPit: duplicate public port ${p.key} between '${seen.${p.key}}' and '${p.container}'"
@@ -144,6 +166,7 @@ let
   domainContainers = lib.filterAttrs (_: c: c.domain != "") mergedContainers;
   hasDomains = domainContainers != {};
 
+  # Fail closed if two containers claim the same reverse-proxy domain.
   _uniqueDomains = lib.foldl' (seen: entry:
     let dom = entry.value.domain;
     in if builtins.hasAttr dom seen then
@@ -151,6 +174,7 @@ let
     else seen // { ${dom} = entry.name; }
   ) {} (lib.attrsToList domainContainers);
 
+  # Generate Caddy virtual hosts (`http://` for local .local/.lan/.home.arpa, HTTPS otherwise).
   caddyVirtualHosts = lib.mapAttrs' (name: c:
     let
       ports = c.ports or [];
@@ -163,12 +187,14 @@ let
     }
   ) domainContainers;
 
+  # Emit systemd-tmpfiles directory rules only for approved persistent host data roots.
   extractHostDir = containerName: volSpec:
     let
       hostPath = builtins.head (lib.splitString ":" volSpec);
       _check = if lib.hasInfix ".." hostPath then throw "NixPit: container '${containerName}' volume '${volSpec}' contains '..'" else true;
     in assert _check; lib.optional (lib.any (r: lib.hasPrefix r hostPath) approvedMountRoots) "d ${hostPath} 0755 root root -";
 
+  # Convert "vendor:product" hex strings into Libvirt XML <hostdev> attribute sets.
   mkUsbHostdev = vp:
     let parts = lib.splitString ":" vp;
     in {
@@ -179,11 +205,13 @@ let
       };
     };
 
+  # Detect repos that define a standard Podman Compose stack.
   composeRepos = lib.filter (name:
     builtins.pathExists "${reposDir}/${name}/docker-compose.yml" ||
     builtins.pathExists "${reposDir}/${name}/compose.yaml"
   ) repoNames;
 in {
+  # Configurable so tests can evaluate isolated fixture directories in /nix/store.
   options.services.nixpit.stateDir = lib.mkOption {
     type = lib.types.str;
     default = "/var/lib/nixpit";
@@ -197,6 +225,7 @@ in {
       lib.concatMap (extractHostDir name) (c.volumes or [])
     ) mergedContainers));
 
+    # Open firewall TCP/UDP ports only for non-loopback bindings (+ 80/443 when Caddy is used).
     networking.firewall.allowedTCPPorts =
       assert builtins.isAttrs _uniquePublicPorts;
       lib.unique (map (p: p.port) (builtins.filter (p: p.proto == "tcp") publicPorts))
@@ -210,6 +239,8 @@ in {
       virtualHosts = assert builtins.isAttrs _uniqueDomains; caddyVirtualHosts;
     };
 
+    # Compile container definitions into Podman systemd units (`podman-<name>.service`).
+    # Secret resolution order: 1) repo sops-nix -> 2) host SOPS tmpfs -> 3) legacy .env.
     virtualisation.oci-containers = {
       backend = "podman";
       containers = lib.mapAttrs (name: c:
@@ -233,6 +264,8 @@ in {
       ) mergedContainers;
     };
 
+    # Compile VM declarations into NixVirt Libvirt domain XMLs.
+    # Uses virtio_video = null so SPICE binds to 127.0.0.1 without requiring host 3D GPU accel.
     virtualisation.libvirt.connections."qemu:///system".domains =
       lib.mapAttrsToList (name: vm:
         let
@@ -261,6 +294,7 @@ in {
         }
       ) mergedVms;
 
+    # Generate ordering dependencies (custom networks + nixpit-secrets) and Compose stack units.
     systemd.services =
       (lib.mapAttrs' (name: c:
         let

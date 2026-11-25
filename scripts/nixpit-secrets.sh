@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# nixpit-secrets — SOPS + Age Secret Management CLI and Service Runner.
+#
+# What: Manages the host Age keypair, encrypts host secrets at rest into
+#       /var/lib/nixpit/secrets/*.sops.env (0600), and decrypts them into
+#       in-memory tmpfs at /run/nixpit/secrets/*.env (0400).
+# How:  Shares the exact same Age key file (/var/lib/nixpit/sops/age/keys.txt)
+#       used by sops-nix, using atomic temp-file writes and strict permissions.
+# Why:  Ensures plaintext credentials never reside on persistent disk, in Git,
+#       or in the world-readable /nix/store.
+
 set -euo pipefail
 
 STATE_DIR="${NIXPIT_STATE_DIR:-/var/lib/nixpit}"
@@ -8,16 +18,20 @@ KEY_FILE="${AGE_DIR}/keys.txt"
 PUB_FILE="${AGE_DIR}/public.key"
 SECRETS_DIR="${STATE_DIR}/secrets"
 
+# Print error to stderr and abort immediately.
 die() {
   echo "nixpit-secrets: $*" >&2
   exit 1
 }
 
+# Validate secret names to prevent path traversal into parent directories.
 validate_name() {
   local name="$1"
   [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "invalid secret name '$name'"
 }
 
+# `init` — Ensure 0700 state/runtime directories and generate the host Age key if absent,
+# then derive and cache the public `age1...` key for encryption and .sops.yaml snippets.
 cmd_init() {
   install -d -m 0755 "${STATE_DIR}"
   install -d -m 0700 "${STATE_DIR}/sops" "${AGE_DIR}" "${SECRETS_DIR}" "${RUNTIME_DIR}"
@@ -35,10 +49,12 @@ cmd_init() {
   printf '%s\n' "$pub"
 }
 
+# `pubkey` — Initialize if needed and print the host Age public key.
 cmd_pubkey() {
   cmd_init
 }
 
+# `sops-config` — Output a ready-to-use .sops.yaml snippet targeting this host's Age key.
 cmd_sops_config() {
   local pub
   pub="$(cmd_init)"
@@ -49,6 +65,7 @@ creation_rules:
 YAML
 }
 
+# List basenames (stripped of `suffix`) inside `dir` sorted alphabetically.
 list_dir_names() {
   local dir="$1"
   local suffix="$2"
@@ -57,6 +74,8 @@ list_dir_names() {
   fi
 }
 
+# `list` — Output JSON summarizing the Age pubkey, encrypted host secrets, tmpfs runtime files,
+# and repo secrets decrypted into /run/secrets/nixpit by sops-nix.
 cmd_list() {
   local pub
   pub="$(cmd_init)"
@@ -76,12 +95,14 @@ cmd_list() {
     '{ agePublicKey: $pub, hostSecrets: $host, runtimeActive: $runtime, sopsNixSecrets: $sopsNix }'
 }
 
+# Decrypt `enc_file` using the host Age key and stream dotenv pairs to stdout.
 decrypt_to_stdout() {
   local enc_file="$1"
   [[ -r "$enc_file" ]] || die "encrypted secret not found: $enc_file"
   SOPS_AGE_KEY_FILE="${KEY_FILE}" sops -d --input-type dotenv --output-type dotenv "$enc_file"
 }
 
+# `get <name>` — Print decrypted KEY=VALUE lines for `name` (used by Cockpit editor).
 cmd_get() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: nixpit-secrets get <name>"
@@ -90,6 +111,8 @@ cmd_get() {
   decrypt_to_stdout "${SECRETS_DIR}/${name}.sops.env"
 }
 
+# Atomically decrypt `<name>.sops.env` into tmpfs `${RUNTIME_DIR}/<name>.env`.
+# Writes with 0600 (owner-writable during redirection) then locks down to 0400 before mv.
 decrypt_one_runtime() {
   local name="$1"
   local enc_file="${SECRETS_DIR}/${name}.sops.env"
@@ -105,6 +128,8 @@ decrypt_one_runtime() {
   mv -f "$tmp" "$out_file"
 }
 
+# `set <name>` — Read KEY=VALUE pairs from stdin, validate keys, encrypt with SOPS+Age into
+# `${SECRETS_DIR}/<name>.sops.env` (0600), and refresh the tmpfs runtime file immediately.
 cmd_set() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: nixpit-secrets set <name>"
@@ -147,6 +172,7 @@ cmd_set() {
   echo "Encrypted ${name}.sops.env and synced runtime secret"
 }
 
+# `delete <name>` — Remove both the encrypted SOPS file and its tmpfs runtime file.
 cmd_delete() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: nixpit-secrets delete <name>"
@@ -155,6 +181,8 @@ cmd_delete() {
   echo "Deleted secret ${name}"
 }
 
+# `sync` — Invoked by nixpit-secrets.service at boot: decrypt all *.sops.env files into tmpfs
+# and prune any stale runtime .env files whose encrypted source was removed.
 cmd_sync() {
   cmd_init >/dev/null
   shopt -s nullglob

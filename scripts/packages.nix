@@ -1,3 +1,5 @@
+# Shared CLI script derivations wrapped with pkgs.writeShellApplication.
+# Reused by both modules/host.nix and flake.nix so runtimeInputs stay in one place.
 { pkgs }:
 
 {

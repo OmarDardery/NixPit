@@ -1,7 +1,12 @@
+// Cockpit client logic for NixPit Workloads.
+// Delegates Git profile operations to `nixpit-repo`, SOPS secret encryption to
+// `nixpit-secrets`, VM lifecycle to `virsh`, and deployments to `nixos-rebuild`.
+
 const STATE = "/var/lib/nixpit";
 const FLAKE_FILE = `${STATE}/hypervisor.flake`;
 
 const $ = id => document.getElementById(id);
+// Escape untrusted strings before rendering into HTML templates to prevent XSS.
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const logsEl = $("logs");
 const repoSel = $("repo-select");
@@ -14,11 +19,13 @@ let envPairs = [];
 let busy = false;
 
 const BUSY_IDS = ["btn-gc", "btn-sync", "btn-diff", "btn-push", "btn-validate", "btn-deploy", "btn-rollback"];
+// Lock/unlock top-level mutating buttons so concurrent Git/NixOS runs cannot collide.
 const setBusy = state => {
   busy = state;
   BUSY_IDS.forEach(id => { const el = $(id); if (el) el.disabled = state; });
 };
 
+// Display a floating toast notification that auto-dismisses after 2.6 seconds.
 function toast(msg, kind = "") {
   const el = document.createElement("div");
   el.className = `toast ${kind ? `toast-${kind}` : ""}`;
@@ -27,12 +34,15 @@ function toast(msg, kind = "") {
   setTimeout(() => el.remove(), 2600);
 }
 
+// Append streamed command output to the bottom terminal pane and auto-scroll.
 const log = m => { logsEl.textContent += m; logsEl.scrollTop = logsEl.scrollHeight; };
 
+// Execute a privileged command via argument vector and return stdout without streaming to UI logs.
 async function spawnText(cmd) {
   return cockpit.spawn(cmd, { superuser: "require", err: "out" });
 }
 
+// Run a privileged command while holding the global busy lock and streaming output to #logs.
 async function run(cmd, clear = true) {
   if (busy) { toast("Another operation is running", "err"); throw new Error("Busy"); }
   setBusy(true);
@@ -50,6 +60,7 @@ async function run(cmd, clear = true) {
   }
 }
 
+// Activate a navigation tab and its matching panel section.
 function switchTab(tabId) {
   document.querySelectorAll(".tab, .panel").forEach(el => el.classList.remove("active"));
   document.querySelector(`.tab[data-tab="${tabId}"]`).classList.add("active");
@@ -58,6 +69,7 @@ function switchTab(tabId) {
 document.querySelectorAll(".tab").forEach(btn => { btn.onclick = () => switchTab(btn.dataset.tab); });
 $("btn-clear-logs").onclick = () => { logsEl.textContent = ""; };
 
+// Show the onboarding checklist until at least one repo profile is added and cloned locally.
 function updateOnboarding() {
   const hasProfiles = profiles.length > 0;
   const hasCloned = profiles.some(p => p.cloned);
@@ -66,6 +78,7 @@ function updateOnboarding() {
   $("step-sync").style.opacity = hasCloned ? "0.45" : "1";
 }
 
+// Query host generation number, root filesystem usage, and /nix/store size in parallel.
 async function refreshHealth() {
   const queries = [
     ["stat-gen", ["sh", "-c", "readlink /nix/var/nix/profiles/system | grep -oE '[0-9]+' || echo '?'"], s => `#${s}`],
@@ -79,6 +92,7 @@ async function refreshHealth() {
   refreshGitBadge();
 }
 
+// Update the topbar Git status pill for the currently selected repo profile.
 function refreshGitBadge() {
   const el = $("stat-git");
   const p = profiles.find(x => x.name === repoSel.value);
@@ -98,12 +112,14 @@ function refreshGitBadge() {
 
 $("btn-gc").onclick = async () => { await run(["nix-collect-garbage"]); refreshHealth(); };
 
+// Read the configured host flake URI (defaults to /etc/nixpit#nixpit created by install.sh).
 async function getFlakeUri() {
   const f = await cockpit.file(FLAKE_FILE, { superuser: "require" }).read();
   return (f && f.trim()) || "path:/etc/nixpit#nixpit";
 }
 
-// --- Profiles (nixpit-repo) ---
+// Load repository profiles via `nixpit-repo list`, render profile cards with per-repo SSH keys,
+// populate the active profile dropdown, and refresh workload/editor views.
 async function loadProfiles() {
   try {
     profiles = JSON.parse((await spawnText(["nixpit-repo", "list"])) || "[]");
@@ -175,6 +191,7 @@ async function loadProfiles() {
   refreshGitBadge();
 }
 
+// Create a new repo profile and auto-generate its dedicated ed25519 SSH key.
 $("btn-add-repo").onclick = async () => {
   const name = $("new-repo-name").value.trim();
   const url = $("new-repo-url").value.trim();
@@ -186,7 +203,7 @@ $("btn-add-repo").onclick = async () => {
   await loadProfiles();
 };
 
-// --- Workloads ---
+// Read and parse guests.json from the active profile checkout, then refresh workload cards.
 async function loadGuestsJson() {
   if (!repoSel.value) return;
   const path = `${STATE}/repos/${repoSel.value}/guests.json`;
@@ -202,16 +219,20 @@ async function loadGuestsJson() {
   renderGuestCards();
 }
 
+// Query systemd service state ("active", "failed", or "inactive") for a Podman/Compose unit.
 async function getUnitState(unit) {
   try { return (await cockpit.spawn(["systemctl", "is-active", unit], { err: "ignore" })).trim(); }
   catch { return "inactive"; }
 }
 
+// Query Libvirt domain state ("running", "shut off", or "not defined") via virsh.
 async function getVmState(name) {
   try { return (await cockpit.spawn(["virsh", "domstate", name], { superuser: "require", err: "ignore" })).trim() || "unknown"; }
   catch { return "not defined"; }
 }
 
+// Extract the public host port from a Docker/Podman port spec, skipping loopback-only bindings
+// (127.0.0.1 / ::1) so "Open" links only target externally reachable endpoints.
 function parsePublicHostPort(portSpec) {
   const addrPart = String(portSpec || "").split("/")[0];
   const v6 = addrPart.match(/^\[([^\]]+)\]:(\d+):(\d+)$/);
@@ -222,6 +243,7 @@ function parsePublicHostPort(portSpec) {
   return null;
 }
 
+// Build and render cards for all declared containers, KVM VMs, and Compose stacks with live status.
 async function renderGuestCards() {
   const containerEl = $("guest-cards");
   const host = window.location.hostname;
@@ -322,6 +344,7 @@ async function renderGuestCards() {
   });
 }
 
+// Populate the container form fields from an existing entry in currentGuests.
 function editContainer(name) {
   const c = currentGuests.containers[name];
   if (!c) return;
@@ -335,6 +358,7 @@ function editContainer(name) {
   $("f-usb").value = (c.usbPassthrough || []).join(", ");
 }
 
+// Populate the VM editor form and switch to the VMs tab.
 function editVm(name) {
   const vm = currentGuests.vms[name];
   if (!vm) return;
@@ -348,6 +372,7 @@ function editVm(name) {
   switchTab("tab-vms");
 }
 
+// Write currentGuests back to guests.json in the active checkout and refresh UI views.
 async function persistGuestsJson() {
   if (!repoSel.value) return;
   const path = `${STATE}/repos/${repoSel.value}/guests.json`;
@@ -359,6 +384,7 @@ async function persistGuestsJson() {
   await loadProfiles();
 }
 
+// Validate and save container form fields while preserving any raw/unshown JSON properties.
 $("btn-save-guest").onclick = async () => {
   const name = $("f-name").value.trim();
   const image = $("f-image").value.trim();
@@ -381,6 +407,7 @@ $("btn-save-guest").onclick = async () => {
 
 $("btn-gen-uuid").onclick = () => { $("vm-uuid").value = crypto.randomUUID(); };
 
+// Validate VM inputs (name, disk, UUID, vCPUs, RAM, network, USB IDs) and save to guests.json.
 $("btn-save-vm").onclick = async () => {
   const name = $("vm-name").value.trim();
   const disk = $("vm-disk").value.trim();
@@ -406,7 +433,7 @@ $("btn-save-vm").onclick = async () => {
 
 $("btn-refresh-status").onclick = renderGuestCards;
 
-// --- USB Scanners ---
+// Scan /dev/serial/by-id/* for stable USB serial device paths used by container passthrough.
 async function scanSerialUsb() {
   const picker = $("usb-picker");
   try {
@@ -415,6 +442,7 @@ async function scanSerialUsb() {
   } catch { picker.innerHTML = "<option value=''>Scan failed</option>"; }
 }
 
+// Parse `lsusb` output into vendor:product pairs for Libvirt VM hostdev USB passthrough.
 async function scanLsusb() {
   const picker = $("lsusb-picker");
   try {
@@ -426,6 +454,7 @@ async function scanLsusb() {
   } catch { picker.innerHTML = "<option value=''>Unavailable</option>"; }
 }
 
+// Append a selected picker option into a comma-separated text input field.
 const appendField = (pickerId, fieldId) => {
   const v = $(pickerId).value;
   if (!v) return;
@@ -436,7 +465,8 @@ $("btn-add-usb").onclick = () => appendField("usb-picker", "f-usb");
 $("btn-scan-lsusb").onclick = scanLsusb;
 $("btn-add-vm-usb").onclick = () => appendField("lsusb-picker", "vm-usb");
 
-// --- Secrets (nixpit-secrets + sops-nix) ---
+// Query `nixpit-secrets list` for the host Age public key, active tmpfs/sops-nix secrets,
+// and encrypted host secret files, then load the selected secret for editing.
 async function loadSecretsOverview() {
   try {
     const info = JSON.parse((await spawnText(["nixpit-secrets", "list"])) || "{}");
@@ -455,6 +485,7 @@ async function loadSecretsOverview() {
   }
 }
 
+// Decrypt the selected SOPS secret to memory via `nixpit-secrets get` and parse KEY=VALUE pairs.
 async function loadSecretFile() {
   const name = $("secret-select").value;
   if (!name) return;
@@ -468,6 +499,7 @@ async function loadSecretFile() {
   renderEnvRows();
 }
 
+// Render masked KEY=VALUE editor rows with show/hide toggles and delete buttons.
 function renderEnvRows() {
   const wrap = $("env-rows");
   wrap.innerHTML = envPairs.map((p, i) => `
@@ -514,6 +546,7 @@ $("btn-new-secret").onclick = () => {
   renderEnvRows();
 };
 
+// Validate KEY=VALUE pairs and pipe them on stdin to `nixpit-secrets set` so plaintext never touches disk.
 $("btn-save-secret").onclick = async () => {
   const name = $("secret-select").value;
   if (!name) return toast("Select or create a secret first", "err");
@@ -540,7 +573,7 @@ $("btn-del-secret").onclick = async () => {
   await loadSecretsOverview();
 };
 
-// --- Raw Editor ---
+// Load the chosen workload file from the active repo profile into the raw editor.
 async function loadRawFile() {
   if (!repoSel.value) return;
   rawEl.value = (await cockpit.file(`${STATE}/repos/${repoSel.value}/${fileSel.value}`, { superuser: "require" }).read()) || "";

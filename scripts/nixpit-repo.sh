@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# nixpit-repo — Per-profile SSH Git keygen and workload repository sync manager.
+#
+# What: Manages Git repo profiles in repos.json, generates an isolated ed25519
+#       SSH deploy key per profile, and clones/syncs/diffs/pushes workload configs.
+# How:  Uses atomic temp-file writes for repos.json, enforces 0700/0600 key perms,
+#       and passes a per-profile GIT_SSH_COMMAND with IdentitiesOnly=yes.
+# Why:  Isolates deploy credentials per repo so compromising one repo key cannot
+#       access others, and refuses dirty overwrites or symlink/secret commits.
+
 set -euo pipefail
 
 STATE_DIR="${NIXPIT_STATE_DIR:-/var/lib/nixpit}"
@@ -7,27 +16,32 @@ REPOS_DIR="${STATE_DIR}/repos"
 KEYS_DIR="${STATE_DIR}/keys"
 KNOWN_HOSTS="${STATE_DIR}/ssh_known_hosts"
 
+# Print an error message to stderr and exit non-zero (fail-closed helper).
 die() {
   echo "nixpit-repo: $*" >&2
   exit 1
 }
 
+# Reject profile names that could cause path traversal or break systemd unit naming.
 validate_name() {
   local name="$1"
   [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "invalid profile name '$name'"
 }
 
+# Reject empty branch names, whitespace, or ".." traversal in ref names.
 validate_branch() {
   local branch="$1"
   [[ -n "$branch" && "$branch" =~ ^[a-zA-Z0-9._/-]+$ && "$branch" != *".."* && "$branch" != /* && "$branch" != */ ]] || die "invalid branch '$branch'"
 }
 
+# Allow only SSH, HTTPS, or local filesystem repository URLs without spaces.
 validate_url() {
   local url="$1"
   [[ -n "$url" && ! "$url" =~ [[:space:]] ]] || die "invalid repository url"
   [[ "$url" =~ ^(git@[a-zA-Z0-9._-]+:|ssh://|https://|file:///|/) ]] || die "unsupported repository url '$url'"
 }
 
+# Initialize state directories with 0700 permissions on keys/ and an empty repos.json array.
 ensure_dirs() {
   install -d -m 0755 "${STATE_DIR}" "${REPOS_DIR}"
   install -d -m 0700 "${KEYS_DIR}"
@@ -36,6 +50,8 @@ ensure_dirs() {
   fi
 }
 
+# Write `content` to a temporary file in the target directory, chmod, and atomically rename.
+# Why: Prevents truncated/corrupt repos.json if interrupted mid-write.
 atomic_write() {
   local target="$1"
   local mode="$2"
@@ -47,18 +63,21 @@ atomic_write() {
   mv -f "$tmp" "$target"
 }
 
+# Build GIT_SSH_COMMAND pinned to this profile's private key and isolated known_hosts file.
 ssh_cmd_for() {
   local key_path="$1"
   printf 'ssh -i %s -o IdentitiesOnly=yes -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new' \
     "$key_path" "$KNOWN_HOSTS"
 }
 
+# Look up a field (url, branch, keyPath) for profile `name` inside repos.json.
 get_profile_field() {
   local name="$1"
   local field="$2"
   jq -er --arg n "$name" --arg f "$field" '.[] | select(.name == $n) | .[$f] // empty' "${REPOS_FILE}"
 }
 
+# Create an ed25519 SSH keypair for `name` (0600 private, 0644 public); rotates only if force=1.
 generate_key() {
   local name="$1"
   local force="${2:-0}"
@@ -73,6 +92,7 @@ generate_key() {
   chmod 0644 "${key_path}.pub"
 }
 
+# `list` — Return JSON array of all profiles enriched with public key, clone state, HEAD, and dirty flag.
 cmd_list() {
   ensure_dirs
   jq -c '.[]' "${REPOS_FILE}" | while IFS= read -r row; do
@@ -105,6 +125,7 @@ cmd_list() {
   done | jq -s '.'
 }
 
+# `add <name> <url> [branch]` — Register a new repo profile, generate its SSH keypair, and print JSON.
 cmd_add() {
   local name="${1:-}" url="${2:-}" branch="${3:-main}"
   [[ -n "$name" && -n "$url" ]] || die "usage: nixpit-repo add <name> <url> [branch]"
@@ -130,6 +151,7 @@ cmd_add() {
     '{ name: $n, url: $u, branch: $b, keyPath: $k, pubkey: $p }'
 }
 
+# `keygen <name> [--force]` — Generate or rotate (--force) a profile's SSH key and print its pubkey.
 cmd_keygen() {
   local name="${1:-}" flag="${2:-}"
   [[ -n "$name" ]] || die "usage: nixpit-repo keygen <name> [--force]"
@@ -151,6 +173,7 @@ cmd_keygen() {
   cat "${key_path}.pub"
 }
 
+# `pubkey <name>` — Print the SSH public key for `name` so the user can add it as a deploy key.
 cmd_pubkey() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: nixpit-repo pubkey <name>"
@@ -160,6 +183,8 @@ cmd_pubkey() {
   cat "$pub"
 }
 
+# Clone (if missing) or fast-forward pull a single profile's pinned branch using its SSH key.
+# Fails closed if the local checkout has uncommitted changes or invalid guests.json.
 sync_one() {
   local name="$1"
   validate_name "$name"
@@ -194,6 +219,7 @@ sync_one() {
   echo "Synced ${name} (${branch}) at $(git -C "$dir" rev-parse --short HEAD)"
 }
 
+# `sync <name|--all>` — Sync one profile or every registered profile.
 cmd_sync() {
   local target="${1:-}"
   [[ -n "$target" ]] || die "usage: nixpit-repo sync <name|--all>"
@@ -209,6 +235,7 @@ cmd_sync() {
   fi
 }
 
+# `diff <name>` — Display working-tree status plus unstaged and staged diffs for `name`.
 cmd_diff() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: nixpit-repo diff <name>"
@@ -220,6 +247,8 @@ cmd_diff() {
   git -C "$dir" diff --cached
 }
 
+# `push <name> [message]` — Stage allowlisted workload files (never plaintext .env or symlinks),
+# commit if changed, and push to the pinned branch using the profile's SSH key.
 cmd_push() {
   local name="${1:-}" msg="${2:-Update NixPit configs}"
   [[ -n "$name" ]] || die "usage: nixpit-repo push <name> [message]"
@@ -260,6 +289,7 @@ cmd_push() {
   )
 }
 
+# `remove <name> [--purge]` — Remove profile from repos.json; delete checkout & keys only with --purge.
 cmd_remove() {
   local name="${1:-}" flag="${2:-}"
   [[ -n "$name" ]] || die "usage: nixpit-repo remove <name> [--purge]"
