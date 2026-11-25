@@ -15,7 +15,7 @@ A declarative, GitOps-driven NixOS hypervisor appliance with Cockpit as its sing
 On an existing x86_64 NixOS machine with flakes enabled and conventional `/etc/nixos/configuration.nix`:
 
 ```sh
-nix run github:OmarDardery/NixPit#install
+sudo nix --extra-experimental-features 'nix-command flakes' run --refresh github:OmarDardery/NixPit#install
 ```
 
 The installer reports network details, preserves existing host configuration, creates a local wrapper flake, locks its inputs, builds and switches. Reserve the reported MAC/IP on your router. Existing flake-based hosts should instead import `nixosModules.default` into their existing flake and initialize the local state manually.
