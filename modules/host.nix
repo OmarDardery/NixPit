@@ -2,6 +2,7 @@
 
 let
   cfg = config.services.nixpit;
+  cli = import ../scripts/packages.nix { inherit pkgs; };
 
   mkCockpitPlugin = { pname, version, src, dest }: pkgs.stdenv.mkDerivation {
     inherit pname version src;
@@ -9,6 +10,7 @@ let
     installPhase = ''
       mkdir -p $out/share/cockpit/${dest}
       cp manifest.json index.html app.js $out/share/cockpit/${dest}/
+      cp ${../cockpit/theme.css} $out/share/cockpit/${dest}/theme.css
     '';
   };
 
@@ -24,12 +26,6 @@ let
     version = "1.0.0";
     src = ../cockpit/virtmon;
     dest = "nixpit-virtmon";
-  };
-
-  nixpit-repo = pkgs.writeShellApplication {
-    name = "nixpit-repo";
-    runtimeInputs = with pkgs; [ git openssh jq coreutils findutils ];
-    text = builtins.readFile ../scripts/nixpit-repo.sh;
   };
 
   nixpit-virtmon = config.boot.kernelPackages.callPackage ../kernel/nixpit-virtmon { };
@@ -78,9 +74,7 @@ in {
               type = "dir";
               name = "default";
               uuid = "a8c9f8b8-4c5d-4d6e-9f7a-1b2c3d4e5f60";
-              target = {
-                path = "/var/lib/libvirt/images";
-              };
+              target = { path = "/var/lib/libvirt/images"; };
             };
           }
         ];
@@ -98,7 +92,6 @@ in {
     };
 
     virtualisation.spiceUSBRedirection.enable = true;
-
     virtualisation.podman = {
       enable = true;
       dockerCompat = true;
@@ -107,11 +100,39 @@ in {
 
     networking.firewall.trustedInterfaces = [ "virbr0" ];
 
+    # Shared Age identity for sops-nix and nixpit-secrets.service
+    sops.age = {
+      keyFile = lib.mkDefault "/var/lib/nixpit/sops/age/keys.txt";
+      generateKey = lib.mkDefault true;
+      sshKeyPaths = lib.mkDefault [];
+    };
+    sops.gnupg.sshKeyPaths = lib.mkDefault [];
+
     systemd.tmpfiles.rules = [
       "d /var/lib/libvirt/images 0711 root root -"
+      "d ${cfg.stateDir}/sops 0700 root root -"
+      "d ${cfg.stateDir}/sops/age 0700 root root -"
+      "d ${cfg.stateDir}/secrets 0700 root root -"
+      "d /run/nixpit 0755 root root -"
+      "d /run/nixpit/secrets 0700 root root -"
     ];
 
-    # Cockpit Web UI
+    systemd.services.nixpit-secrets = {
+      description = "NixPit SOPS secret management service";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "podman.service" ];
+      after = [ "local-fs.target" ];
+      environment = {
+        NIXPIT_STATE_DIR = cfg.stateDir;
+        NIXPIT_RUNTIME_DIR = "/run/nixpit/secrets";
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${cli.nixpit-secrets}/bin/nixpit-secrets sync";
+      };
+    };
+
     services.cockpit = {
       enable = true;
       openFirewall = true;
@@ -135,7 +156,10 @@ in {
     };
 
     environment.systemPackages = with pkgs; [
-      nixpit-repo
+      cli.nixpit-repo
+      cli.nixpit-secrets
+      sops
+      age
       libvirt
       qemu_kvm
       podman-compose

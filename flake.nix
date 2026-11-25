@@ -14,24 +14,7 @@
   outputs = { self, nixpkgs, nixvirt, sops-nix, ... }: let
     system = "x86_64-linux";
     pkgs = nixpkgs.legacyPackages.${system};
-
-    installer = pkgs.writeShellApplication {
-      name = "nixpit-install";
-      runtimeInputs = with pkgs; [ nix nixos-rebuild iproute2 jq coreutils gawk ];
-      text = builtins.readFile ./scripts/install.sh;
-    };
-
-    nixpitRepoPkg = pkgs.writeShellApplication {
-      name = "nixpit-repo";
-      runtimeInputs = with pkgs; [ git openssh jq coreutils findutils ];
-      text = builtins.readFile ./scripts/nixpit-repo.sh;
-    };
-
-    nixpitSecretsPkg = pkgs.writeShellApplication {
-      name = "nixpit-secrets";
-      runtimeInputs = with pkgs; [ sops age jq coreutils findutils gnused ];
-      text = builtins.readFile ./scripts/nixpit-secrets.sh;
-    };
+    cli = import ./scripts/packages.nix { inherit pkgs; };
 
     ciSystem = nixpkgs.lib.nixosSystem {
       inherit system;
@@ -58,9 +41,7 @@
         --input-type dotenv --output-type dotenv web.env > "$out/repos/test-repo/secrets/web.sops.env"
 
       cat > "$out/repos.json" <<'JSON'
-      [
-        { "name": "test-repo", "url": "https://github.com/example/test-repo.git", "branch": "main" }
-      ]
+      [{ "name": "test-repo", "url": "https://github.com/example/test-repo.git", "branch": "main" }]
 JSON
       cat > "$out/repos/test-repo/guests.json" <<'JSON'
       {
@@ -143,12 +124,12 @@ JSON
   in {
     apps.${system}.install = {
       type = "app";
-      program = "${installer}/bin/nixpit-install";
+      program = "${cli.nixpit-install}/bin/nixpit-install";
       meta.description = "Install and configure NixPit on an existing NixOS host";
     };
 
     packages.${system} = {
-      default = installer;
+      default = cli.nixpit-install;
       inherit virtmon;
       vm-test = pkgs.testers.runNixOSTest {
         name = "nixpit-virtualization-vm-test";
@@ -181,16 +162,11 @@ JSON
           machine.succeed("systemctl show -p Result nixvirt.service | grep -q 'Result=success'")
           machine.succeed("systemctl show -p Result nixpit-secrets.service | grep -q 'Result=success'")
 
-          # 1. Verify kernel module + /proc interface + dmesg
-          lsmod_out = machine.succeed("lsmod")
-          assert "nixpit_virtmon" in lsmod_out, f"nixpit_virtmon missing from lsmod:\n{lsmod_out}"
-
+          # 1. Kernel module + /proc interface + dmesg
+          assert "nixpit_virtmon" in machine.succeed("lsmod")
           status = json.loads(machine.succeed("cat /proc/nixpit_virtmon/status"))
           assert status["module"] == "nixpit_virtmon", status
-          assert status["probes"]["module_notifier"] is True, status
-          assert status["probes"]["netdev_notifier"] is True, status
-          assert status["probes"]["vfs_open_kprobe"] is True, status
-          assert status["probes"]["exec_kprobe"] is True, status
+          assert all(status["probes"][p] is True for p in ("module_notifier", "netdev_notifier", "vfs_open_kprobe", "exec_kprobe")), status
 
           machine.succeed("printf 'probe\n' > /proc/nixpit_virtmon/control")
           events = [json.loads(l) for l in machine.succeed("cat /proc/nixpit_virtmon/events").splitlines() if l.strip()]
@@ -201,26 +177,25 @@ JSON
           cleared = [json.loads(l) for l in machine.succeed("cat /proc/nixpit_virtmon/events").splitlines() if l.strip()]
           assert len(cleared) == 1 and "cleared" in cleared[0]["message"], cleared
 
-          # 2. Verify libvirt default network & storage pool + Cockpit manifests
+          # 2. Libvirt default network & pool + Cockpit manifests & shared theme.css
           assert "active" in machine.succeed("virsh net-list --all")
           assert "active" in machine.succeed("virsh pool-list --all")
-          machine.succeed("test -r /etc/cockpit/share/cockpit/homelab-gitops/manifest.json")
-          machine.succeed("test -r /etc/cockpit/share/cockpit/nixpit-virtmon/manifest.json")
+          for p in ("homelab-gitops", "nixpit-virtmon"):
+            machine.succeed(f"test -r /etc/cockpit/share/cockpit/{p}/manifest.json")
+            machine.succeed(f"test -r /etc/cockpit/share/cockpit/{p}/theme.css")
 
-          # 3. Verify sops-nix decrypted secret using shared host Age key
+          # 3. sops-nix & nixpit-secrets
           assert machine.succeed("stat -c '%a' /run/secrets/nixpit/vm-secret").strip() == "400"
           assert machine.succeed("cat /run/secrets/nixpit/vm-secret").strip() == "VM_SOPS_OK=yes"
 
-          # 4. Verify nixpit-secrets encryption at rest and service tmpfs decryption
           machine.succeed("printf 'DB_PASS=correct-horse-battery\n' | nixpit-secrets set db")
-          enc = machine.succeed("cat /var/lib/nixpit/secrets/db.sops.env")
-          assert "correct-horse-battery" not in enc, "Plaintext leaked into encrypted sops file"
+          assert "correct-horse-battery" not in machine.succeed("cat /var/lib/nixpit/secrets/db.sops.env")
           assert machine.succeed("stat -c '%a' /run/nixpit/secrets/db.env").strip() == "400"
           assert machine.succeed("cat /run/nixpit/secrets/db.env").strip() == "DB_PASS=correct-horse-battery"
           machine.succeed("rm -f /run/nixpit/secrets/db.env && systemctl restart nixpit-secrets.service")
           assert machine.succeed("cat /run/nixpit/secrets/db.env").strip() == "DB_PASS=correct-horse-battery"
 
-          # 5. Verify nixpit-repo SSH keygen, profile management, and config sync
+          # 4. nixpit-repo SSH keygen, profile management, and config sync
           machine.succeed("""
             set -eu
             git init --bare /tmp/remote.git
@@ -231,7 +206,6 @@ JSON
             git -C /tmp/seed -c user.name=Test -c user.email=t@t commit -m init
             git -C /tmp/seed push origin main
             nixpit-repo add lab /tmp/remote.git main
-            test -f /var/lib/nixpit/keys/lab.ed25519
             test "$(stat -c '%a' /var/lib/nixpit/keys/lab.ed25519)" = "600"
             old_pub=$(nixpit-repo pubkey lab)
             nixpit-repo sync lab
@@ -249,7 +223,6 @@ JSON
         nixvirt.nixosModules.default
         sops-nix.nixosModules.sops
         ./modules/host.nix
-        ./modules/secrets.nix
         ./modules/guest-loader.nix
       ];
       _module.args.nixvirt = nixvirt;
@@ -272,8 +245,8 @@ JSON
         test -x ${pkgs.swtpm}/bin/swtpm
         test -x ${pkgs.sops}/bin/sops
         test -x ${pkgs.age}/bin/age-keygen
-        test -x ${nixpitRepoPkg}/bin/nixpit-repo
-        test -x ${nixpitSecretsPkg}/bin/nixpit-secrets
+        test -x ${cli.nixpit-repo}/bin/nixpit-repo
+        test -x ${cli.nixpit-secrets}/bin/nixpit-secrets
         test -n "$(find ${virtmon}/lib/modules -type f \( -name 'nixpit_virtmon.ko' -o -name 'nixpit_virtmon.ko.xz' -o -name 'nixpit_virtmon.ko.zst' \) | head -n 1)"
         ${pkgs.lib.concatMapStringsSep "\n" (plugin:
           "test -d ${plugin}/share/cockpit") config.services.cockpit.plugins}
@@ -310,7 +283,6 @@ JSON
         export NIXPIT_STATE_DIR="$TMPDIR/state"
         export NIXPIT_RUNTIME_DIR="$TMPDIR/run"
 
-        # Test nixpit-repo
         git init --bare "$TMPDIR/remote.git"
         git clone "$TMPDIR/remote.git" "$TMPDIR/seed"
         git -C "$TMPDIR/seed" -c user.name=Test -c user.email=t@t checkout -b main
@@ -319,27 +291,25 @@ JSON
         git -C "$TMPDIR/seed" -c user.name=Test -c user.email=t@t commit -m init
         git -C "$TMPDIR/seed" push origin main
 
-        ${nixpitRepoPkg}/bin/nixpit-repo add p1 "file://$TMPDIR/remote.git" main >/dev/null
-        test -f "$NIXPIT_STATE_DIR/keys/p1.ed25519"
+        ${cli.nixpit-repo}/bin/nixpit-repo add p1 "file://$TMPDIR/remote.git" main >/dev/null
         test "$(stat -c '%a' "$NIXPIT_STATE_DIR/keys/p1.ed25519")" = "600"
-        ${nixpitRepoPkg}/bin/nixpit-repo sync p1
+        ${cli.nixpit-repo}/bin/nixpit-repo sync p1
         test -f "$NIXPIT_STATE_DIR/repos/p1/guests.json"
-        ${nixpitRepoPkg}/bin/nixpit-repo keygen p1 --force >/dev/null
-        ${nixpitRepoPkg}/bin/nixpit-repo remove p1 --purge >/dev/null
+        ${cli.nixpit-repo}/bin/nixpit-repo keygen p1 --force >/dev/null
+        ${cli.nixpit-repo}/bin/nixpit-repo remove p1 --purge >/dev/null
         test ! -d "$NIXPIT_STATE_DIR/repos/p1"
 
-        # Test nixpit-secrets
-        pub=$(${nixpitSecretsPkg}/bin/nixpit-secrets pubkey)
+        pub=$(${cli.nixpit-secrets}/bin/nixpit-secrets pubkey)
         [[ "$pub" == age1* ]]
-        ${nixpitSecretsPkg}/bin/nixpit-secrets sops-config | grep -q "$pub"
-        printf 'API_TOKEN=super-secret-value\n' | ${nixpitSecretsPkg}/bin/nixpit-secrets set app1 >/dev/null
+        ${cli.nixpit-secrets}/bin/nixpit-secrets sops-config | grep -q "$pub"
+        printf 'API_TOKEN=super-secret-value\n' | ${cli.nixpit-secrets}/bin/nixpit-secrets set app1 >/dev/null
         ! grep -q 'super-secret-value' "$NIXPIT_STATE_DIR/secrets/app1.sops.env"
-        test "$(${nixpitSecretsPkg}/bin/nixpit-secrets get app1)" = "API_TOKEN=super-secret-value"
+        test "$(${cli.nixpit-secrets}/bin/nixpit-secrets get app1)" = "API_TOKEN=super-secret-value"
         test "$(cat "$NIXPIT_RUNTIME_DIR/app1.env")" = "API_TOKEN=super-secret-value"
         rm -f "$NIXPIT_RUNTIME_DIR/app1.env"
-        ${nixpitSecretsPkg}/bin/nixpit-secrets sync
+        ${cli.nixpit-secrets}/bin/nixpit-secrets sync
         test "$(cat "$NIXPIT_RUNTIME_DIR/app1.env")" = "API_TOKEN=super-secret-value"
-        ${nixpitSecretsPkg}/bin/nixpit-secrets delete app1 >/dev/null
+        ${cli.nixpit-secrets}/bin/nixpit-secrets delete app1 >/dev/null
         test ! -e "$NIXPIT_RUNTIME_DIR/app1.env"
         touch $out
       '';
@@ -365,12 +335,8 @@ JSON
         assert builtins.length domains == 2;
         assert builtins.length networks == 1;
         assert builtins.length pools == 1;
-        assert pkgs.lib.elem 8080 tcpPorts;
-        assert pkgs.lib.elem 8443 tcpPorts;
-        assert pkgs.lib.elem 80 tcpPorts;
-        assert pkgs.lib.elem 443 tcpPorts;
-        assert !(pkgs.lib.elem 3000 tcpPorts);
-        assert !(pkgs.lib.elem 3001 tcpPorts);
+        assert pkgs.lib.elem 8080 tcpPorts && pkgs.lib.elem 8443 tcpPorts && pkgs.lib.elem 80 tcpPorts && pkgs.lib.elem 443 tcpPorts;
+        assert !(pkgs.lib.elem 3000 tcpPorts) && !(pkgs.lib.elem 3001 tcpPorts);
         assert udpPorts == [ 5353 ];
         assert caddyOn && hasVhost && hasNetUnit && hasComposeUnit;
         assert hasSopsSecret && pkgs.lib.hasPrefix "/run/secrets/" sopsPath && pkgs.lib.elem sopsPath webEnvFiles;

@@ -26,11 +26,10 @@ Open `https://<server-ip>:9090` on a trusted LAN, sign in as an existing adminis
 
 - `flake.nix` — installer, kernel monitor package, exported NixOS module, checks and VM test
 - `kernel/nixpit-virtmon/` — out-of-tree Linux kernel module (`nixpit_virtmon.ko`) monitoring KVM, module, virtual network and virtualization process activity
-- `modules/host.nix` — platform services, KVM/Libvirt virtualization, `nixpit-repo` and kernel monitor wiring
-- `modules/secrets.nix` — `sops-nix` configuration and `nixpit-secrets.service`
+- `modules/host.nix` — platform services, KVM/Libvirt virtualization, `sops-nix`, `nixpit-secrets.service`, `nixpit-repo` and kernel monitor wiring
 - `modules/guest-loader.nix` — validated workload and SOPS secret translation
-- `cockpit/` — custom control plane (`homelab-gitops` and `virtmon` Virtualization Monitor panel)
-- `scripts/` — bootstrap, static checks, `nixpit-repo` and `nixpit-secrets` CLIs
+- `cockpit/` — shared Vercel-style theme (`theme.css`) and Cockpit panels (`homelab-gitops` and `virtmon`)
+- `scripts/` — shared package definitions (`packages.nix`), bootstrap, checks, `nixpit-repo` and `nixpit-secrets` CLIs
 - `templates/guests/` — example external workload repository (not automatically deployed)
 - `docs/architecture.md` — intended behavior, gaps and release gates
 

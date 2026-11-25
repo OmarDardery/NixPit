@@ -13,127 +13,88 @@ let
   approvedMountRoots = [ "/var/lib/" "/srv/" "/mnt/" "/data/" ];
 
   assertIdent = kind: value:
-    if builtins.isString value && builtins.match identRegex value != null then
-      value
-    else
-      throw "NixPit: invalid ${kind} identifier '${toString value}'";
+    if builtins.isString value && builtins.match identRegex value != null then value
+    else throw "NixPit: invalid ${kind} identifier '${toString value}'";
 
   assertNoTraversal = kind: value:
-    if builtins.isString value && value != "" && !(lib.hasInfix ".." value) then
-      value
-    else
-      throw "NixPit: invalid ${kind} path '${toString value}'";
+    if builtins.isString value && value != "" && !(lib.hasInfix ".." value) then value
+    else throw "NixPit: invalid ${kind} path '${toString value}'";
 
   registry = "${stateDir}/repos.json";
   repoNames =
     if builtins.pathExists registry then
-      map (r: assertIdent "repository" (r.name or ""))
-        (builtins.fromJSON (builtins.readFile registry))
-    else
-      [];
+      map (r: assertIdent "repository" (r.name or "")) (builtins.fromJSON (builtins.readFile registry))
+    else [];
 
-  loadRepoGuests = name:
+  loadedGuests = map (name:
     let jsonFile = "${reposDir}/${name}/guests.json";
-    in {
-      inherit name;
-      data = if builtins.pathExists jsonFile then builtins.fromJSON (builtins.readFile jsonFile) else {};
-    };
-
-  loadedGuests = map loadRepoGuests repoNames;
+    in { inherit name; data = if builtins.pathExists jsonFile then builtins.fromJSON (builtins.readFile jsonFile) else {}; }
+  ) repoNames;
 
   mergeUnique = key:
     lib.foldl' (acc: entry:
       let
         raw = entry.data.${key} or {};
-        next =
-          if key == "containers" then
-            lib.mapAttrs (_: v: v // { _repo = entry.name; }) raw
-          else
-            raw;
+        next = if key == "containers" then lib.mapAttrs (_: v: v // { _repo = entry.name; }) raw else raw;
         overlap = lib.intersectAttrs acc next;
       in
         if overlap != {} then
           throw "NixPit: duplicate ${key}: ${builtins.concatStringsSep ", " (builtins.attrNames overlap)}"
-        else
-          acc // next
+        else acc // next
     ) {} loadedGuests;
 
-  rawContainers = mergeUnique "containers";
-  rawVms = mergeUnique "vms";
-
-  # Validate containers
   mergedContainers = lib.mapAttrs (name: c:
     let
       _name = assertIdent "container" name;
       _image =
         if builtins.isString (c.image or null) && c.image != "" then c.image
         else throw "NixPit: container '${name}' missing non-empty image";
-      _secret =
-        if (c.secretName or "") != "" then assertIdent "secretName" c.secretName
-        else _name;
-      _net =
-        if (c.network or "") != "" then assertIdent "network" c.network
-        else "";
+      _secret = if (c.secretName or "") != "" then assertIdent "secretName" c.secretName else _name;
+      _net = if (c.network or "") != "" then assertIdent "network" c.network else "";
       _dom =
         if (c.domain or "") != "" then
           if builtins.match domainRegex c.domain != null then c.domain
           else throw "NixPit: container '${name}' has invalid domain '${c.domain}'"
         else "";
+      repoSopsFile = "${reposDir}/${c._repo}/secrets/${_secret}.sops.env";
+      hostSopsFile = "${secretsDir}/${_secret}.sops.env";
     in c // {
       image = _image;
       secretName = _secret;
       network = _net;
       domain = _dom;
+      _repoSopsFile = repoSopsFile;
+      _hasRepoSops = builtins.pathExists repoSopsFile;
+      _hasHostSops = builtins.pathExists hostSopsFile;
     }
-  ) rawContainers;
+  ) (mergeUnique "containers");
 
-  # Validate VMs
   mergedVms = lib.mapAttrs (name: vm:
     let
       _name = assertIdent "vm" name;
       _uuid =
         if builtins.isString (vm.uuid or null) && builtins.match uuidRegex vm.uuid != null then vm.uuid
         else throw "NixPit: vm '${name}' has invalid uuid '${toString (vm.uuid or "")}'";
-      _vcpus =
-        let v = vm.vcpus or 2;
-        in if builtins.isInt v && v >= 1 then v
-           else throw "NixPit: vm '${name}' has invalid vcpus '${toString v}'";
-      _mem =
-        let m = vm.memoryGiB or 2;
-        in if builtins.isInt m && m >= 1 then m
-           else throw "NixPit: vm '${name}' has invalid memoryGiB '${toString m}'";
+      _vcpus = let v = vm.vcpus or 2; in if builtins.isInt v && v >= 1 then v else throw "NixPit: vm '${name}' invalid vcpus";
+      _mem = let m = vm.memoryGiB or 2; in if builtins.isInt m && m >= 1 then m else throw "NixPit: vm '${name}' invalid memoryGiB";
       _disk = assertNoTraversal "vm disk" (vm.disk or "");
-      _pool =
-        if (vm.storagePool or "") != "" then assertIdent "storagePool" vm.storagePool
-        else "default";
-      _net =
-        if (vm.network or "default") != "default" then assertIdent "vm network" vm.network
-        else "default";
+      _pool = if (vm.storagePool or "") != "" then assertIdent "storagePool" vm.storagePool else "default";
+      _net = if (vm.network or "default") != "default" then assertIdent "vm network" vm.network else "default";
       _usb = map (vp:
         if builtins.isString vp && builtins.match usbVpRegex vp != null then vp
         else throw "NixPit: vm '${name}' has invalid USB vendor:product '${toString vp}'"
       ) (vm.usbPassthrough or []);
     in vm // {
-      uuid = _uuid;
-      vcpus = _vcpus;
-      memoryGiB = _mem;
-      disk = _disk;
-      storagePool = _pool;
-      network = _net;
-      usbPassthrough = _usb;
+      uuid = _uuid; vcpus = _vcpus; memoryGiB = _mem;
+      disk = _disk; storagePool = _pool; network = _net; usbPassthrough = _usb;
     }
-  ) rawVms;
+  ) (mergeUnique "vms");
 
-  # Repo-embedded SOPS secrets managed via sops-nix
   repoSopsSecrets = lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (_: c:
-    let repoSopsFile = "${reposDir}/${c._repo}/secrets/${c.secretName}.sops.env";
-    in lib.optional (builtins.pathExists repoSopsFile) {
+    lib.optional c._hasRepoSops {
       name = "nixpit/${c.secretName}";
       value = {
-        sopsFile = builtins.path {
-          path = repoSopsFile;
-          name = "nixpit-${c.secretName}.sops.env";
-        };
+        sopsFile = builtins.path { path = c._repoSopsFile; name = "nixpit-${c.secretName}.sops.env"; };
         format = "dotenv";
         key = "";
         mode = "0400";
@@ -141,7 +102,6 @@ let
     }
   ) mergedContainers));
 
-  # Parse port specs: [hostIp:]hostPort:containerPort[/proto]
   parsePortSpec = containerName: rawSpec:
     let
       protoParts = lib.splitString "/" rawSpec;
@@ -150,57 +110,33 @@ let
         if protoCount == 1 then "tcp"
         else if protoCount == 2 && (builtins.elemAt protoParts 1 == "tcp" || builtins.elemAt protoParts 1 == "udp") then
           builtins.elemAt protoParts 1
-        else
-          throw "NixPit: container '${containerName}' has invalid port protocol in '${rawSpec}'";
+        else throw "NixPit: container '${containerName}' invalid port protocol '${rawSpec}'";
       addrPart = builtins.elemAt protoParts 0;
       ipv6Match = builtins.match "^\\[([0-9a-fA-F:]+)]:([0-9]+):([0-9]+)$" addrPart;
       stdParts = lib.splitString ":" addrPart;
       parsed =
-        if ipv6Match != null then {
-          hostIp = builtins.elemAt ipv6Match 0;
-          hostPortStr = builtins.elemAt ipv6Match 1;
-        }
-        else if builtins.length stdParts == 2 then {
-          hostIp = "";
-          hostPortStr = builtins.elemAt stdParts 0;
-        }
-        else if builtins.length stdParts == 3 then {
-          hostIp = builtins.elemAt stdParts 0;
-          hostPortStr = builtins.elemAt stdParts 1;
-        }
-        else
-          throw "NixPit: container '${containerName}' has invalid port spec '${rawSpec}'";
+        if ipv6Match != null then { hostIp = builtins.elemAt ipv6Match 0; hostPortStr = builtins.elemAt ipv6Match 1; }
+        else if builtins.length stdParts == 2 then { hostIp = ""; hostPortStr = builtins.elemAt stdParts 0; }
+        else if builtins.length stdParts == 3 then { hostIp = builtins.elemAt stdParts 0; hostPortStr = builtins.elemAt stdParts 1; }
+        else throw "NixPit: container '${containerName}' invalid port spec '${rawSpec}'";
       hostPort =
-        if builtins.match "^[0-9]+$" parsed.hostPortStr != null then
-          lib.toInt parsed.hostPortStr
-        else
-          throw "NixPit: container '${containerName}' has non-numeric host port in '${rawSpec}'";
+        if builtins.match "^[0-9]+$" parsed.hostPortStr != null then lib.toInt parsed.hostPortStr
+        else throw "NixPit: container '${containerName}' non-numeric port '${rawSpec}'";
       _portRange =
         if hostPort >= 1 && hostPort <= 65535 then hostPort
-        else throw "NixPit: container '${containerName}' port ${toString hostPort} out of range (1..65535)";
+        else throw "NixPit: container '${containerName}' port ${toString hostPort} out of range";
       isLoopback = parsed.hostIp == "127.0.0.1" || parsed.hostIp == "::1";
-    in {
-      port = _portRange;
-      inherit proto isLoopback;
-      isPublic = !isLoopback;
-      key = "${proto}:${toString _portRange}";
-    };
+    in { port = _portRange; inherit proto; isPublic = !isLoopback; key = "${proto}:${toString _portRange}"; };
 
-  allParsedPorts = lib.concatLists (lib.mapAttrsToList (name: c:
+  publicPorts = builtins.filter (p: p.isPublic) (lib.concatLists (lib.mapAttrsToList (name: c:
     map (p: parsePortSpec name p // { container = name; }) (c.ports or [])
-  ) mergedContainers);
-
-  publicPortBindings = builtins.filter (p: p.isPublic) allParsedPorts;
+  ) mergedContainers));
 
   _uniquePublicPorts = lib.foldl' (seen: p:
     if builtins.hasAttr p.key seen then
       throw "NixPit: duplicate public port ${p.key} between '${seen.${p.key}}' and '${p.container}'"
-    else
-      seen // { ${p.key} = p.container; }
-  ) {} publicPortBindings;
-
-  allContainerTcpPorts = lib.unique (map (p: p.port) (builtins.filter (p: p.proto == "tcp") publicPortBindings));
-  allContainerUdpPorts = lib.unique (map (p: p.port) (builtins.filter (p: p.proto == "udp") publicPortBindings));
+    else seen // { ${p.key} = p.container; }
+  ) {} publicPorts;
 
   customNetworks = lib.unique (lib.filter (n: n != "" && n != "host" && n != "bridge" && n != "none")
     (map (c: c.network) (builtins.attrValues mergedContainers)));
@@ -212,52 +148,31 @@ let
     let dom = entry.value.domain;
     in if builtins.hasAttr dom seen then
       throw "NixPit: duplicate domain '${dom}' between '${seen.${dom}}' and '${entry.name}'"
-    else
-      seen // { ${dom} = entry.name; }
+    else seen // { ${dom} = entry.name; }
   ) {} (lib.attrsToList domainContainers);
 
   caddyVirtualHosts = lib.mapAttrs' (name: c:
     let
       ports = c.ports or [];
-      _hasPorts =
-        if ports != [] then true
-        else throw "NixPit: container '${name}' declares domain '${c.domain}' without any ports";
-      firstParsed = parsePortSpec name (builtins.head ports);
+      _hasPorts = if ports != [] then true else throw "NixPit: container '${name}' has domain '${c.domain}' without ports";
+      firstPort = parsePortSpec name (builtins.head ports);
       isLocal = lib.hasSuffix ".local" c.domain || lib.hasSuffix ".lan" c.domain || lib.hasSuffix ".home.arpa" c.domain;
-      hostKey = if isLocal then "http://${c.domain}" else c.domain;
     in assert _hasPorts; {
-      name = hostKey;
-      value.extraConfig = ''
-        reverse_proxy 127.0.0.1:${toString firstParsed.port}
-      '';
+      name = if isLocal then "http://${c.domain}" else c.domain;
+      value.extraConfig = "reverse_proxy 127.0.0.1:${toString firstPort.port}\n";
     }
   ) domainContainers;
 
   extractHostDir = containerName: volSpec:
     let
       hostPath = builtins.head (lib.splitString ":" volSpec);
-      isApproved = lib.any (root: lib.hasPrefix root hostPath) approvedMountRoots;
-      hasTraversal = lib.hasInfix ".." hostPath;
-      _checkTraversal =
-        if hasTraversal then
-          throw "NixPit: container '${containerName}' volume '${volSpec}' contains '..'"
-        else true;
-    in
-      assert _checkTraversal;
-      if isApproved then [ "d ${hostPath} 0755 root root -" ] else [];
-
-  allTmpfilesRules = lib.unique (
-    lib.concatLists (lib.mapAttrsToList (name: c:
-      lib.concatMap (extractHostDir name) (c.volumes or [])
-    ) mergedContainers)
-  );
+      _check = if lib.hasInfix ".." hostPath then throw "NixPit: container '${containerName}' volume '${volSpec}' contains '..'" else true;
+    in assert _check; lib.optional (lib.any (r: lib.hasPrefix r hostPath) approvedMountRoots) "d ${hostPath} 0755 root root -";
 
   mkUsbHostdev = vp:
     let parts = lib.splitString ":" vp;
     in {
-      mode = "subsystem";
-      type = "usb";
-      managed = true;
+      mode = "subsystem"; type = "usb"; managed = true;
       source = {
         vendor = { id = lib.fromHexString (builtins.elemAt parts 0); };
         product = { id = lib.fromHexString (builtins.elemAt parts 1); };
@@ -278,14 +193,17 @@ in {
   config = {
     sops.secrets = repoSopsSecrets;
 
-    systemd.tmpfiles.rules = allTmpfilesRules;
+    systemd.tmpfiles.rules = lib.unique (lib.concatLists (lib.mapAttrsToList (name: c:
+      lib.concatMap (extractHostDir name) (c.volumes or [])
+    ) mergedContainers));
 
     networking.firewall.allowedTCPPorts =
       assert builtins.isAttrs _uniquePublicPorts;
-      allContainerTcpPorts ++ lib.optionals hasDomains [ 80 443 ];
+      lib.unique (map (p: p.port) (builtins.filter (p: p.proto == "tcp") publicPorts))
+      ++ lib.optionals hasDomains [ 80 443 ];
     networking.firewall.allowedUDPPorts =
       assert builtins.isAttrs _uniquePublicPorts;
-      allContainerUdpPorts;
+      lib.unique (map (p: p.port) (builtins.filter (p: p.proto == "udp") publicPorts));
 
     services.caddy = lib.mkIf hasDomains {
       enable = true;
@@ -296,14 +214,11 @@ in {
       backend = "podman";
       containers = lib.mapAttrs (name: c:
         let
-          repoSopsPath = "${reposDir}/${c._repo}/secrets/${c.secretName}.sops.env";
-          hasRepoSops = builtins.pathExists repoSopsPath;
-          hasHostSops = builtins.pathExists "${secretsDir}/${c.secretName}.sops.env";
-          legacySecretPath = "${secretsDir}/${c.secretName}.env";
+          legacySecret = "${secretsDir}/${c.secretName}.env";
           autoSecret =
-            if hasRepoSops then [ config.sops.secrets."nixpit/${c.secretName}".path ]
-            else if hasHostSops then [ "/run/nixpit/secrets/${c.secretName}.env" ]
-            else lib.optional (builtins.pathExists legacySecretPath) legacySecretPath;
+            if c._hasRepoSops then [ config.sops.secrets."nixpit/${c.secretName}".path ]
+            else if c._hasHostSops then [ "/run/nixpit/secrets/${c.secretName}.env" ]
+            else lib.optional (builtins.pathExists legacySecret) legacySecret;
           netOpt = lib.optional (c.network != "") "--network=${c.network}";
         in {
           image = c.image;
@@ -313,10 +228,7 @@ in {
           environment = c.environment or {};
           environmentFiles = lib.unique ((c.environmentFiles or []) ++ autoSecret);
           dependsOn = c.dependsOn or [];
-          extraOptions =
-            (c.extraOptions or [])
-            ++ netOpt
-            ++ (map (dev: "--device=${dev}:${dev}") (c.usbPassthrough or []));
+          extraOptions = (c.extraOptions or []) ++ netOpt ++ map (dev: "--device=${dev}:${dev}") (c.usbPassthrough or []);
         }
       ) mergedContainers;
     };
@@ -324,54 +236,37 @@ in {
     virtualisation.libvirt.connections."qemu:///system".domains =
       lib.mapAttrsToList (name: vm:
         let
-          storageVol =
-            if lib.hasPrefix "/" vm.disk then vm.disk
-            else { pool = vm.storagePool; volume = vm.disk; };
           isDefaultNet = vm.network == "default";
           baseDomain = nixvirt.lib.domain.templates.linux {
             inherit name;
             uuid = vm.uuid;
             memory = { count = vm.memoryGiB; unit = "GiB"; };
-            storage_vol = storageVol;
+            storage_vol = if lib.hasPrefix "/" vm.disk then vm.disk else { pool = vm.storagePool; volume = vm.disk; };
             bridge_name = if isDefaultNet then "virbr0" else vm.network;
             virtio_video = null;
           };
           usbDevs = map mkUsbHostdev vm.usbPassthrough;
-          netInterface =
-            if isDefaultNet then {
-              type = "network";
-              model = { type = "virtio"; };
-              source = { network = "default"; };
-            }
-            else baseDomain.devices.interface;
-          finalDomain = baseDomain // {
+        in {
+          active = vm.active or true;
+          definition = nixvirt.lib.domain.writeXML (baseDomain // {
             vcpu = { count = vm.vcpus; };
             devices = (baseDomain.devices or {}) // {
-              interface = netInterface;
+              interface =
+                if isDefaultNet then { type = "network"; model = { type = "virtio"; }; source = { network = "default"; }; }
+                else baseDomain.devices.interface;
             } // lib.optionalAttrs (usbDevs != []) {
               hostdev = (baseDomain.devices.hostdev or []) ++ usbDevs;
             };
-          };
-        in {
-          active = vm.active or true;
-          definition = nixvirt.lib.domain.writeXML finalDomain;
+          });
         }
       ) mergedVms;
 
     systemd.services =
       (lib.mapAttrs' (name: c:
         let
-          isCustomNet = lib.elem c.network customNetworks;
-          usesHostSops =
-            !(builtins.pathExists "${reposDir}/${c._repo}/secrets/${c.secretName}.sops.env")
-            && builtins.pathExists "${secretsDir}/${c.secretName}.sops.env";
-          deps =
-            lib.optional isCustomNet "podman-network-${c.network}.service"
-            ++ lib.optional usesHostSops "nixpit-secrets.service";
-        in lib.nameValuePair "podman-${name}" (lib.mkIf (deps != []) {
-          requires = deps;
-          after = deps;
-        })
+          deps = lib.optional (lib.elem c.network customNetworks) "podman-network-${c.network}.service"
+            ++ lib.optional (!c._hasRepoSops && c._hasHostSops) "nixpit-secrets.service";
+        in lib.nameValuePair "podman-${name}" (lib.mkIf (deps != []) { requires = deps; after = deps; })
       ) mergedContainers)
       // (lib.listToAttrs (map (net: {
         name = "podman-network-${net}";
@@ -380,13 +275,8 @@ in {
           wantedBy = [ "multi-user.target" ];
           after = [ "network-online.target" "podman.service" ];
           path = [ pkgs.podman ];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-          };
-          script = ''
-            podman network exists "${net}" || podman network create "${net}"
-          '';
+          serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+          script = ''podman network exists "${net}" || podman network create "${net}"'';
         };
       }) customNetworks))
       // (lib.listToAttrs (map (name: {

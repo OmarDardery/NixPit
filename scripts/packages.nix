@@ -1,0 +1,21 @@
+{ pkgs }:
+
+{
+  nixpit-install = pkgs.writeShellApplication {
+    name = "nixpit-install";
+    runtimeInputs = with pkgs; [ nix nixos-rebuild iproute2 jq coreutils gawk ];
+    text = builtins.readFile ./install.sh;
+  };
+
+  nixpit-repo = pkgs.writeShellApplication {
+    name = "nixpit-repo";
+    runtimeInputs = with pkgs; [ git openssh jq coreutils findutils ];
+    text = builtins.readFile ./nixpit-repo.sh;
+  };
+
+  nixpit-secrets = pkgs.writeShellApplication {
+    name = "nixpit-secrets";
+    runtimeInputs = with pkgs; [ sops age jq coreutils findutils gnused ];
+    text = builtins.readFile ./nixpit-secrets.sh;
+  };
+}
