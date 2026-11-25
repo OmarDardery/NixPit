@@ -6,9 +6,9 @@ A declarative, GitOps-driven NixOS hypervisor appliance with Cockpit as its sing
 
 ## Architecture
 
-- **NixPit host:** NixOS, KVM/Libvirt via NixVirt (with `virbr0` NAT network, `default` storage pool, nested virtualization, `virtiofsd` and `swtpm`), rootful Podman, Podman Compose, Caddy, Cockpit Machines/Podman, custom NixPit Workloads & Virtualization Monitor plugins, `nixpit_virtmon.ko` kernel monitor module, and ble.sh.
-- **Independent workload repositories:** plain `guests.json`, `compose.yaml` or `docker-compose.yml`, and Dockerfiles. No NixOS boilerplate. See [template](templates/guests/).
-- **Local state:** `/var/lib/nixpit` stores registered repositories, deploy key, local environment files and host flake reference. Secrets and workload data do not belong in Git or the Nix store.
+- **NixPit host:** NixOS, KVM/Libvirt via NixVirt (with `virbr0` NAT network, `default` storage pool, nested virtualization, `virtiofsd` and `swtpm`), rootful Podman, Podman Compose, Caddy, Cockpit Machines/Podman, custom NixPit Workloads & Virtualization Monitor plugins, `nixpit_virtmon.ko` kernel monitor module, `nixpit-repo` per-profile SSH keygen/sync, `sops-nix` + `nixpit-secrets.service`, and ble.sh.
+- **Independent workload repositories:** plain `guests.json`, `compose.yaml` or `docker-compose.yml`, Dockerfiles, and optional `secrets/*.sops.env` encrypted for the host Age key. No NixOS boilerplate. See [template](templates/guests/).
+- **Local state:** `/var/lib/nixpit` stores repo profiles (`repos.json`), per-profile SSH keys (`keys/`), checkouts (`repos/`), host Age key (`sops/age/keys.txt`), and SOPS-encrypted host secrets (`secrets/*.sops.env`). Plaintext secrets are decrypted only into `/run/secrets/nixpit` (`sops-nix`) or `/run/nixpit/secrets` (`nixpit-secrets.service`), never Git or the Nix store.
 
 ## Bootstrap (test host only)
 
@@ -26,10 +26,11 @@ Open `https://<server-ip>:9090` on a trusted LAN, sign in as an existing adminis
 
 - `flake.nix` — installer, kernel monitor package, exported NixOS module, checks and VM test
 - `kernel/nixpit-virtmon/` — out-of-tree Linux kernel module (`nixpit_virtmon.ko`) monitoring KVM, module, virtual network and virtualization process activity
-- `modules/host.nix` — platform services, KVM/Libvirt virtualization and kernel monitor wiring
-- `modules/guest-loader.nix` — validated workload translation
+- `modules/host.nix` — platform services, KVM/Libvirt virtualization, `nixpit-repo` and kernel monitor wiring
+- `modules/secrets.nix` — `sops-nix` configuration and `nixpit-secrets.service`
+- `modules/guest-loader.nix` — validated workload and SOPS secret translation
 - `cockpit/` — custom control plane (`homelab-gitops` and `virtmon` Virtualization Monitor panel)
-- `scripts/install.sh` — bootstrap
+- `scripts/` — bootstrap, static checks, `nixpit-repo` and `nixpit-secrets` CLIs
 - `templates/guests/` — example external workload repository (not automatically deployed)
 - `docs/architecture.md` — intended behavior, gaps and release gates
 

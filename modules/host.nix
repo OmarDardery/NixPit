@@ -3,26 +3,33 @@
 let
   cfg = config.services.nixpit;
 
-  cockpit-homelab = pkgs.stdenv.mkDerivation {
-    pname = "cockpit-homelab";
-    version = "4.0.0";
-    src = ../cockpit;
+  mkCockpitPlugin = { pname, version, src, dest }: pkgs.stdenv.mkDerivation {
+    inherit pname version src;
     passthru.cockpitPath = [];
     installPhase = ''
-      mkdir -p $out/share/cockpit/homelab-gitops
-      cp manifest.json index.html app.js $out/share/cockpit/homelab-gitops/
+      mkdir -p $out/share/cockpit/${dest}
+      cp manifest.json index.html app.js $out/share/cockpit/${dest}/
     '';
   };
 
-  cockpit-virtmon = pkgs.stdenv.mkDerivation {
+  cockpit-homelab = mkCockpitPlugin {
+    pname = "cockpit-homelab";
+    version = "4.0.0";
+    src = ../cockpit;
+    dest = "homelab-gitops";
+  };
+
+  cockpit-virtmon = mkCockpitPlugin {
     pname = "cockpit-virtmon";
     version = "1.0.0";
     src = ../cockpit/virtmon;
-    passthru.cockpitPath = [];
-    installPhase = ''
-      mkdir -p $out/share/cockpit/nixpit-virtmon
-      cp manifest.json index.html app.js $out/share/cockpit/nixpit-virtmon/
-    '';
+    dest = "nixpit-virtmon";
+  };
+
+  nixpit-repo = pkgs.writeShellApplication {
+    name = "nixpit-repo";
+    runtimeInputs = with pkgs; [ git openssh jq coreutils findutils ];
+    text = builtins.readFile ../scripts/nixpit-repo.sh;
   };
 
   nixpit-virtmon = config.boot.kernelPackages.callPackage ../kernel/nixpit-virtmon { };
@@ -48,7 +55,7 @@ in {
       options kvm_amd nested=1
     '';
 
-    # Virtualization Engines (KVM/QEMU/Libvirt + Rootful Podman)
+    # Virtualization Engines (KVM/QEMU/Libvirt via NixVirt + Rootful Podman)
     virtualisation.libvirt = {
       enable = true;
       swtpm.enable = true;
@@ -81,7 +88,6 @@ in {
     };
 
     virtualisation.libvirtd = {
-      enable = true;
       onBoot = "ignore";
       onShutdown = "shutdown";
       qemu = {
@@ -99,7 +105,6 @@ in {
       defaultNetwork.settings.dns_enabled = true;
     };
 
-    # Allow VM NAT bridge traffic on virbr0
     networking.firewall.trustedInterfaces = [ "virbr0" ];
 
     systemd.tmpfiles.rules = [
@@ -117,12 +122,10 @@ in {
       ] ++ lib.optional cfg.virtmon.enable cockpit-virtmon;
     };
 
-    # ble.sh for Cockpit's Web Terminal & SSH
     programs.bash.interactiveShellInit = ''
       [[ $- == *i* ]] && source ${pkgs.blesh}/share/blesh/ble.sh
     '';
 
-    # Default Git identity for Cockpit Commit & Push
     programs.git = {
       enable = true;
       config = {
@@ -131,12 +134,8 @@ in {
       };
     };
 
-    # Auto-sync intentionally unavailable until the transactional backend is implemented.
-
     environment.systemPackages = with pkgs; [
-      cockpit-machines
-      cockpit-podman
-      cockpit-homelab
+      nixpit-repo
       libvirt
       qemu_kvm
       podman-compose
@@ -145,6 +144,6 @@ in {
       git
       jq
       openssh
-    ] ++ lib.optional cfg.virtmon.enable cockpit-virtmon;
+    ];
   };
 }

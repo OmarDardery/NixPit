@@ -93,7 +93,7 @@ function renderStatus(status) {
   document.getElementById("m-process").textContent = String(c.process ?? 0);
   document.getElementById("m-ring").textContent = `${c.ring_used ?? 0} / ${c.ring_capacity ?? 512}`;
   document.getElementById("ring-info").textContent =
-    `Ring: ${c.ring_used ?? 0}/${c.ring_capacity ?? 512} • Dropped: ${c.dropped ?? 0} • dmesg: ${status.dmesg_enabled ? "on" : "off"}`;
+    `Ring: ${c.ring_used ?? 0}/${c.ring_capacity ?? 512} • Dropped: ${c.dropped ?? 0}`;
 }
 
 async function refreshLoadedModules() {
@@ -280,16 +280,13 @@ document.querySelectorAll(".filter-btn").forEach(btn => {
   };
 });
 
-document.getElementById("btn-export-json").onclick = () => {
-  downloadBlob("nixpit-virtmon-events.json", "application/json", JSON.stringify(currentEvents, null, 2));
-};
-
-document.getElementById("btn-export-log").onclick = () => {
+document.getElementById("btn-export").onclick = () => {
   const source = document.getElementById("log-source").value;
-  const text = source === "ring"
-    ? currentEvents.map(ev => `[${formatTs(ev.ts_sec, ev.ts_nsec)}] [${ev.category}] [${ev.level}] pid=${ev.pid} comm=${ev.comm} ${ev.message}`).join("\n")
-    : currentRawText;
-  downloadBlob(`nixpit-virtmon-${source}.log`, "text/plain", text);
+  if (source === "ring") {
+    downloadBlob("nixpit-virtmon-events.json", "application/json", JSON.stringify(currentEvents, null, 2));
+  } else {
+    downloadBlob(`nixpit-virtmon-${source}.log`, "text/plain", currentRawText);
+  }
 };
 
 updateLiveTimer();

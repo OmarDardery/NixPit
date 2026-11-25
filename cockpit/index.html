@@ -16,7 +16,8 @@
     input, select, textarea { padding: 0.45rem; background: #111; color: #fff; border: 1px solid #444; border-radius: 4px; font-family: inherit; }
     textarea { width: 100%; height: 300px; font-family: monospace; box-sizing: border-box; }
     button { padding: 0.42rem 0.82rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; color: #fff; background: #3a3a3a; font-size: 0.85rem; }
-    button:hover { filter: brightness(1.15); }
+    button:hover:not(:disabled) { filter: brightness(1.15); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
     .primary { background: var(--blue); } .success { background: var(--green); } .danger { background: var(--red); } .warn { background: var(--amber); }
     .tabs { display: flex; gap: 0.4rem; border-bottom: 1px solid var(--border); margin-bottom: 1rem; padding-bottom: 0.5rem; }
     .tab { background: transparent; border: 1px solid transparent; color: var(--muted); }
@@ -27,7 +28,7 @@
     .badge-err { background: #7f1d1d; color: #fecaca; }
     .badge-warn { background: #78350f; color: #fde68a; }
     .badge-unk { background: #374151; color: #d1d5db; }
-    .item-row { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem; background: #161616; border: 1px solid var(--border); border-radius: 4px; margin-top: 0.4rem; }
+    .item-row { padding: 0.65rem; background: #161616; border: 1px solid var(--border); border-radius: 4px; margin-top: 0.5rem; }
     pre { background: #0d0d0d; border: 1px solid var(--border); padding: 0.75rem; height: 200px; overflow-y: auto; font-size: 0.82rem; margin: 0; white-space: pre-wrap; }
     code { word-break: break-all; font-size: 0.84rem; color: #9cdcfe; }
     label { font-size: 0.8rem; color: var(--muted); display: block; margin-bottom: 0.2rem; }
@@ -36,7 +37,6 @@
   </style>
 </head>
 <body>
-  <!-- Host Health & Maintenance Strip -->
   <div class="health-bar">
     <div class="row" style="gap: 1.2rem;">
       <span><strong>Generation:</strong> <span id="stat-gen">...</span></span>
@@ -47,12 +47,11 @@
     <button id="btn-gc" class="warn" title="Collect unreachable store paths; keep generations">Garbage Collect</button>
   </div>
 
-  <!-- Top GitOps Action Bar -->
   <div class="row between" style="margin-bottom: 0.75rem;">
-    <h2 style="margin: 0;">NixPit GitOps</h2>
+    <h2 style="margin: 0;">NixPit Workloads</h2>
     <div class="row">
-      <select id="repo-select" title="Active Guest Repository"></select>
-      <button id="btn-pull">Git Pull</button>
+      <select id="repo-select" title="Active Repo Profile"></select>
+      <button id="btn-sync">Sync Configs</button>
       <button id="btn-diff">View Diff</button>
       <input id="commit-msg" placeholder="Commit message..." size="18" />
       <button id="btn-push" class="primary">Commit &amp; Push</button>
@@ -62,39 +61,29 @@
     </div>
   </div>
 
-  <!-- Onboarding Wizard (auto-hides once key + repo exist) -->
   <div id="onboarding" class="card" style="border-color: var(--blue); display: none;">
-    <h3>Welcome to your NixOS Hypervisor</h3>
+    <h3>Welcome to NixPit</h3>
     <ol style="line-height: 1.8; margin-bottom: 0;">
-      <li id="step-key">Open <strong>Git &amp; Settings</strong> → Generate &amp; copy your SSH Deploy Key to GitHub (with Write Access)</li>
-      <li id="step-repo">Add and clone your first Guest Git Repository</li>
-      <li id="step-deploy">Add any <code>.env</code> secrets, click <strong>Validate</strong>, then <strong>Deploy All</strong></li>
+      <li id="step-profile">Open <strong>Repo Profiles</strong> → Add a profile to generate its dedicated SSH deploy key and copy it to your Git provider</li>
+      <li id="step-sync">Click <strong>Sync Configs</strong> to pull <code>guests.json</code>, Compose stacks, and SOPS secrets</li>
+      <li>Add encrypted secrets in <strong>SOPS Secrets</strong>, click <strong>Validate</strong>, then <strong>Deploy All</strong></li>
     </ol>
   </div>
 
-  <!-- Navigation Tabs -->
   <div class="tabs">
     <button class="tab active" data-tab="tab-guests">Guests &amp; Status</button>
     <button class="tab" data-tab="tab-vms">VM Editor</button>
-    <button class="tab" data-tab="tab-secrets">Secrets &amp; Env Vars</button>
+    <button class="tab" data-tab="tab-secrets">SOPS Secrets</button>
     <button class="tab" data-tab="tab-code">Raw Code Editor</button>
-    <button class="tab" data-tab="tab-settings">Git &amp; Settings</button>
+    <button class="tab" data-tab="tab-settings">Repo Profiles</button>
   </div>
 
-  <!-- TAB 1: Containers, Compose & Live Status -->
+  <!-- TAB 1: Containers, VMs & Compose -->
   <div id="tab-guests" class="panel active">
     <div class="card">
       <div class="row between" style="margin-bottom: 0.6rem;">
         <strong>Declared Workloads (Containers, VMs &amp; Compose)</strong>
-        <div class="row">
-          <select id="template-select">
-            <option value="">+ Add from Template...</option>
-            <option value="klipper">Klipper + Moonraker + Mainsail</option>
-            <option value="aiostreams">AIOStreams + Cloudflared</option>
-            <option value="vm-debian">Debian 13 KVM VM</option>
-          </select>
-          <button id="btn-refresh-status">Refresh Status</button>
-        </div>
+        <button id="btn-refresh-status">Refresh Status</button>
       </div>
       <div id="guest-cards" class="grid"></div>
     </div>
@@ -106,11 +95,11 @@
         <div><label>OCI Image</label><input id="f-image" class="full" placeholder="e.g. ghcr.io/home-assistant/home-assistant:stable" /></div>
         <div><label>Ports (comma-separated, e.g. 8123:8123)</label><input id="f-ports" class="full" placeholder="8080:80, 127.0.0.1:3000:3000" /></div>
         <div><label>Volumes (comma-separated, host:container)</label><input id="f-volumes" class="full" placeholder="/var/lib/app:/data" /></div>
-        <div><label>Custom Podman Network (optional)</label><input id="f-network" class="full" placeholder="e.g. printer-net or media-net" /></div>
-        <div><label>Reverse Proxy Domain (Auto-Caddy, optional)</label><input id="f-domain" class="full" placeholder="e.g. printer.home.arpa or app.example.com" /></div>
-        <div><label>Secret Name (loads /var/lib/nixpit/secrets/&lt;name&gt;.env)</label><input id="f-secret" class="full" placeholder="e.g. aiostreams" /></div>
+        <div><label>Custom Podman Network (optional)</label><input id="f-network" class="full" placeholder="e.g. app-net" /></div>
+        <div><label>Reverse Proxy Domain (Auto-Caddy, optional)</label><input id="f-domain" class="full" placeholder="e.g. app.home.arpa" /></div>
+        <div><label>Secret Name (SOPS repo or host secret)</label><input id="f-secret" class="full" placeholder="e.g. app" /></div>
         <div>
-          <label>Serial USB Passthrough (Live <code>/dev/serial/by-id</code>)</label>
+          <label>Serial USB Passthrough (<code>/dev/serial/by-id</code>)</label>
           <div class="row">
             <select id="usb-picker" style="flex:1;"></select>
             <button id="btn-add-usb" type="button">+ Attach</button>
@@ -123,7 +112,7 @@
     </div>
   </div>
 
-  <!-- TAB 2: Visual VM Editor (NixVirt + lsusb passthrough) -->
+  <!-- TAB 2: VM Editor -->
   <div id="tab-vms" class="panel">
     <div class="card">
       <h3>Add / Edit KVM Virtual Machine in <code>guests.json</code></h3>
@@ -138,10 +127,10 @@
         </div>
         <div><label>vCPUs</label><input id="vm-vcpus" type="number" min="1" value="2" class="full" /></div>
         <div><label>Memory (GiB)</label><input id="vm-mem" type="number" min="1" value="2" class="full" /></div>
-        <div><label>Disk Volume (in Libvirt 'default' pool)</label><input id="vm-disk" class="full" placeholder="e.g. debian-13.qcow2" /></div>
+        <div><label>Disk Volume (in Libvirt 'default' pool or full path)</label><input id="vm-disk" class="full" placeholder="e.g. debian-13.qcow2" /></div>
         <div><label>Network / Bridge Name</label><input id="vm-net" class="full" value="default" placeholder="default or br0" /></div>
         <div style="grid-column: span 2;">
-          <label>USB Device Passthrough (Live <code>lsusb</code> Vendor:Product IDs — e.g. USB Wi-Fi Dongle)</label>
+          <label>USB Device Passthrough (<code>lsusb</code> Vendor:Product IDs)</label>
           <div class="row">
             <select id="lsusb-picker" style="flex:1;"></select>
             <button id="btn-add-vm-usb" type="button">+ Attach USB</button>
@@ -154,20 +143,36 @@
     </div>
   </div>
 
-  <!-- TAB 3: Secrets & Env Vars -->
+  <!-- TAB 3: SOPS Secrets -->
   <div id="tab-secrets" class="panel">
+    <div class="card">
+      <div class="row between" style="margin-bottom: 0.45rem;">
+        <strong>Host Age Public Key (for <code>sops-nix</code> &amp; <code>nixpit-secrets</code>)</strong>
+        <div class="row">
+          <button id="btn-copy-age">Copy Age Key</button>
+          <button id="btn-copy-sops-yaml">Copy .sops.yaml</button>
+          <button id="btn-sync-secrets" class="warn">Sync Runtime</button>
+        </div>
+      </div>
+      <code id="age-pubkey">Loading...</code>
+      <div id="sops-summary" style="color: var(--muted); font-size: 0.82rem; margin-top: 0.4rem;"></div>
+    </div>
+
     <div class="card">
       <div class="row between" style="margin-bottom: 0.75rem;">
         <div class="row">
-          <strong>Secret File:</strong>
+          <strong>Encrypted Secret:</strong>
           <select id="secret-select"></select>
           <input id="new-secret-name" placeholder="new-service-name" />
-          <button id="btn-new-secret" class="primary">+ New .env</button>
+          <button id="btn-new-secret" class="primary">+ New</button>
         </div>
-        <button id="btn-save-secret" class="success">Save Secret (chmod 600)</button>
+        <div class="row">
+          <button id="btn-save-secret" class="success">Encrypt &amp; Save</button>
+          <button id="btn-del-secret" class="danger">Delete</button>
+        </div>
       </div>
       <p style="color: var(--muted); font-size: 0.85rem; margin-top: 0;">
-        Stored strictly on this server in <code>/var/lib/nixpit/secrets/</code> — never committed to Git.
+        Encrypted at rest with SOPS + Age in <code>/var/lib/nixpit/secrets/&lt;name&gt;.sops.env</code> and decrypted into tmpfs <code>/run/nixpit/secrets/</code> by <code>nixpit-secrets.service</code>. Repo-committed <code>secrets/&lt;name&gt;.sops.env</code> files are decrypted via <code>sops-nix</code> into <code>/run/secrets/nixpit/</code>.
       </p>
       <div id="env-rows"></div>
       <button id="btn-add-env-row" style="margin-top: 0.6rem;">+ Add Variable</button>
@@ -182,8 +187,10 @@
           <strong>File:</strong>
           <select id="file-select">
             <option value="guests.json">guests.json</option>
+            <option value="compose.yaml">compose.yaml</option>
             <option value="docker-compose.yml">docker-compose.yml</option>
             <option value="Dockerfile">Dockerfile</option>
+            <option value=".sops.yaml">.sops.yaml</option>
           </select>
         </div>
         <button id="btn-save-raw" class="primary">Save File</button>
@@ -192,40 +199,25 @@
     </div>
   </div>
 
-  <!-- TAB 5: Git & Settings -->
+  <!-- TAB 5: Repo Profiles (Per-Repo SSH Keygen & Sync) -->
   <div id="tab-settings" class="panel">
     <div class="card">
-      <div class="row between" style="margin-bottom: 0.5rem;">
-        <strong>SSH Deploy Key</strong>
-        <div class="row">
-          <button id="btn-gen-key" class="primary">Generate Key</button>
-          <button id="btn-copy-key">Copy Public Key</button>
+      <h3>Add Repository Profile (Auto-Generates Dedicated SSH Deploy Key)</h3>
+      <div class="form-grid">
+        <div><label>Profile Name</label><input id="new-repo-name" class="full" placeholder="e.g. homelab-prod" /></div>
+        <div><label>Branch</label><input id="new-repo-branch" class="full" value="main" placeholder="main" /></div>
+        <div style="grid-column: span 2;">
+          <label>Git Repository URL (SSH or HTTPS)</label>
+          <div class="row">
+            <input id="new-repo-url" placeholder="git@github.com:user/guests-repo.git" style="flex: 1;" />
+            <button id="btn-add-repo" class="primary">+ Add Profile &amp; Generate Key</button>
+          </div>
         </div>
-      </div>
-      <code id="pub-key">Loading...</code>
-    </div>
-
-    <div class="card">
-      <strong>Guest Git Repositories</strong>
-      <div class="row" style="margin-top: 0.5rem;">
-        <input id="new-repo-url" placeholder="git@github.com:user/guests-repo.git" style="flex: 1;" />
-        <button id="btn-add-repo" class="primary">+ Add &amp; Clone</button>
       </div>
       <div id="repo-list" style="margin-top: 0.5rem;"></div>
     </div>
-
-    <div class="card">
-      <div class="row between">
-        <div>
-          <strong>Background Auto-Sync (Every 15 Minutes)</strong>
-          <div style="color: var(--muted); font-size: 0.85rem;">Automatically pulls all Git repos and redeploys on new commits.</div>
-        </div>
-        <button id="btn-toggle-autosync">Checking...</button>
-      </div>
-    </div>
   </div>
 
-  <!-- Live Streaming Output -->
   <div class="card">
     <div class="row between" style="margin-bottom: 0.4rem;">
       <strong>Live Output</strong>

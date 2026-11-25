@@ -34,14 +34,22 @@ let
 
   loadRepoGuests = name:
     let jsonFile = "${reposDir}/${name}/guests.json";
-    in if builtins.pathExists jsonFile then builtins.fromJSON (builtins.readFile jsonFile) else {};
+    in {
+      inherit name;
+      data = if builtins.pathExists jsonFile then builtins.fromJSON (builtins.readFile jsonFile) else {};
+    };
 
   loadedGuests = map loadRepoGuests repoNames;
 
   mergeUnique = key:
-    lib.foldl' (acc: g:
+    lib.foldl' (acc: entry:
       let
-        next = g.${key} or {};
+        raw = entry.data.${key} or {};
+        next =
+          if key == "containers" then
+            lib.mapAttrs (_: v: v // { _repo = entry.name; }) raw
+          else
+            raw;
         overlap = lib.intersectAttrs acc next;
       in
         if overlap != {} then
@@ -116,7 +124,24 @@ let
     }
   ) rawVms;
 
-  # Parse port specs: [hostIp:]hostPort:containerPort[/proto], supporting IPv6 brackets like [::1]:3000:3000/udp
+  # Repo-embedded SOPS secrets managed via sops-nix
+  repoSopsSecrets = lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (_: c:
+    let repoSopsFile = "${reposDir}/${c._repo}/secrets/${c.secretName}.sops.env";
+    in lib.optional (builtins.pathExists repoSopsFile) {
+      name = "nixpit/${c.secretName}";
+      value = {
+        sopsFile = builtins.path {
+          path = repoSopsFile;
+          name = "nixpit-${c.secretName}.sops.env";
+        };
+        format = "dotenv";
+        key = "";
+        mode = "0400";
+      };
+    }
+  ) mergedContainers));
+
+  # Parse port specs: [hostIp:]hostPort:containerPort[/proto]
   parsePortSpec = containerName: rawSpec:
     let
       protoParts = lib.splitString "/" rawSpec;
@@ -167,7 +192,6 @@ let
 
   publicPortBindings = builtins.filter (p: p.isPublic) allParsedPorts;
 
-  # Reject duplicate public port bindings across containers
   _uniquePublicPorts = lib.foldl' (seen: p:
     if builtins.hasAttr p.key seen then
       throw "NixPit: duplicate public port ${p.key} between '${seen.${p.key}}' and '${p.container}'"
@@ -178,11 +202,9 @@ let
   allContainerTcpPorts = lib.unique (map (p: p.port) (builtins.filter (p: p.proto == "tcp") publicPortBindings));
   allContainerUdpPorts = lib.unique (map (p: p.port) (builtins.filter (p: p.proto == "udp") publicPortBindings));
 
-  # Custom Podman networks declared by containers
   customNetworks = lib.unique (lib.filter (n: n != "" && n != "host" && n != "bridge" && n != "none")
     (map (c: c.network) (builtins.attrValues mergedContainers)));
 
-  # Caddy virtual hosts for containers with a `domain` field
   domainContainers = lib.filterAttrs (_: c: c.domain != "") mergedContainers;
   hasDomains = domainContainers != {};
 
@@ -211,7 +233,6 @@ let
     }
   ) domainContainers;
 
-  # Restrict auto-created bind-mount host directories to approved data roots
   extractHostDir = containerName: volSpec:
     let
       hostPath = builtins.head (lib.splitString ":" volSpec);
@@ -226,13 +247,11 @@ let
       if isApproved then [ "d ${hostPath} 0755 root root -" ] else [];
 
   allTmpfilesRules = lib.unique (
-    [ "d ${secretsDir} 0700 root root -" ]
-    ++ lib.concatLists (lib.mapAttrsToList (name: c:
+    lib.concatLists (lib.mapAttrsToList (name: c:
       lib.concatMap (extractHostDir name) (c.volumes or [])
     ) mergedContainers)
   );
 
-  # NixVirt USB hostdev entries from "vendor:product" hex strings
   mkUsbHostdev = vp:
     let parts = lib.splitString ":" vp;
     in {
@@ -245,7 +264,6 @@ let
       };
     };
 
-  # Detect repos containing compose.yaml or docker-compose.yml
   composeRepos = lib.filter (name:
     builtins.pathExists "${reposDir}/${name}/docker-compose.yml" ||
     builtins.pathExists "${reposDir}/${name}/compose.yaml"
@@ -254,14 +272,14 @@ in {
   options.services.nixpit.stateDir = lib.mkOption {
     type = lib.types.str;
     default = "/var/lib/nixpit";
-    description = "Directory containing NixPit repository registry, checkouts, and local secrets.";
+    description = "Directory containing NixPit repository registry, checkouts, keys, and encrypted secrets.";
   };
 
   config = {
-    # Auto-create approved bind-mount host directories & secrets folder
+    sops.secrets = repoSopsSecrets;
+
     systemd.tmpfiles.rules = allTmpfilesRules;
 
-    # Auto-open public container host ports (+ 80/443 if Caddy domains are used)
     networking.firewall.allowedTCPPorts =
       assert builtins.isAttrs _uniquePublicPorts;
       allContainerTcpPorts ++ lib.optionals hasDomains [ 80 443 ];
@@ -269,19 +287,23 @@ in {
       assert builtins.isAttrs _uniquePublicPorts;
       allContainerUdpPorts;
 
-    # Automatic Reverse Proxy via Caddy when any container declares `domain`
     services.caddy = lib.mkIf hasDomains {
       enable = true;
       virtualHosts = assert builtins.isAttrs _uniqueDomains; caddyVirtualHosts;
     };
 
-    # Compile Declared Containers -> Podman OCI Containers
     virtualisation.oci-containers = {
       backend = "podman";
       containers = lib.mapAttrs (name: c:
         let
-          secretPath = "${secretsDir}/${c.secretName}.env";
-          autoSecret = lib.optional (builtins.pathExists secretPath) secretPath;
+          repoSopsPath = "${reposDir}/${c._repo}/secrets/${c.secretName}.sops.env";
+          hasRepoSops = builtins.pathExists repoSopsPath;
+          hasHostSops = builtins.pathExists "${secretsDir}/${c.secretName}.sops.env";
+          legacySecretPath = "${secretsDir}/${c.secretName}.env";
+          autoSecret =
+            if hasRepoSops then [ config.sops.secrets."nixpit/${c.secretName}".path ]
+            else if hasHostSops then [ "/run/nixpit/secrets/${c.secretName}.env" ]
+            else lib.optional (builtins.pathExists legacySecretPath) legacySecretPath;
           netOpt = lib.optional (c.network != "") "--network=${c.network}";
         in {
           image = c.image;
@@ -299,7 +321,6 @@ in {
       ) mergedContainers;
     };
 
-    # Compile Declared VMs -> NixVirt Libvirt Domains
     virtualisation.libvirt.connections."qemu:///system".domains =
       lib.mapAttrsToList (name: vm:
         let
@@ -337,12 +358,21 @@ in {
         }
       ) mergedVms;
 
-    # Generate systemd services for custom Podman networks & Compose/Dockerfile repos
     systemd.services =
-      (lib.mapAttrs' (name: c: lib.nameValuePair "podman-${name}" (lib.mkIf (lib.elem c.network customNetworks) {
-        requires = [ "podman-network-${c.network}.service" ];
-        after = [ "podman-network-${c.network}.service" ];
-      })) mergedContainers)
+      (lib.mapAttrs' (name: c:
+        let
+          isCustomNet = lib.elem c.network customNetworks;
+          usesHostSops =
+            !(builtins.pathExists "${reposDir}/${c._repo}/secrets/${c.secretName}.sops.env")
+            && builtins.pathExists "${secretsDir}/${c.secretName}.sops.env";
+          deps =
+            lib.optional isCustomNet "podman-network-${c.network}.service"
+            ++ lib.optional usesHostSops "nixpit-secrets.service";
+        in lib.nameValuePair "podman-${name}" (lib.mkIf (deps != []) {
+          requires = deps;
+          after = deps;
+        })
+      ) mergedContainers)
       // (lib.listToAttrs (map (net: {
         name = "podman-network-${net}";
         value = {

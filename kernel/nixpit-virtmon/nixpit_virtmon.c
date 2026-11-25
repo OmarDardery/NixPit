@@ -19,9 +19,7 @@
 #include <linux/sched.h>
 #include <linux/cred.h>
 #include <linux/user_namespace.h>
-#include <linux/atomic.h>
 #include <linux/string.h>
-#include <linux/kvm.h>
 #include <linux/stdarg.h>
 #ifdef CONFIG_X86
 #include <asm/cpufeature.h>
@@ -39,7 +37,6 @@ struct virtmon_event {
 	u64 seq;
 	s64 ts_sec;
 	u32 ts_nsec;
-	u64 mono_ns;
 	char category[16];
 	char level[8];
 	pid_t pid;
@@ -61,8 +58,6 @@ static u64 cnt_network;
 static u64 cnt_process;
 static u64 cnt_system;
 
-static atomic_t dmesg_enabled = ATOMIC_INIT(1);
-
 static bool cpu_vmx;
 static bool cpu_svm;
 static bool cpu_hypervisor;
@@ -71,8 +66,6 @@ static bool module_notifier_active;
 static bool netdev_notifier_active;
 static bool vfs_open_kprobe_active;
 static bool exec_kprobe_active;
-static bool kvm_dev_ioctl_kprobe_active;
-static bool kvm_vm_ioctl_kprobe_active;
 
 static struct proc_dir_entry *proc_dir;
 static struct proc_dir_entry *proc_status;
@@ -103,7 +96,6 @@ static void virtmon_record(const char *category, const char *level, const char *
 	ktime_get_real_ts64(&ts);
 	ev.ts_sec = ts.tv_sec;
 	ev.ts_nsec = (u32)ts.tv_nsec;
-	ev.mono_ns = ktime_get_ns();
 
 	strscpy(ev.category, category ? category : "system", sizeof(ev.category));
 	strscpy(ev.level, level ? level : "info", sizeof(ev.level));
@@ -144,10 +136,8 @@ static void virtmon_record(const char *category, const char *level, const char *
 	ring_buf[idx] = ev;
 	spin_unlock_irqrestore(&ring_lock, flags);
 
-	if (atomic_read(&dmesg_enabled)) {
-		printk_ratelimited(KERN_INFO pr_fmt("[%s] [%s] pid=%d comm=%s %s\n"),
-				   ev.category, ev.level, ev.pid, ev.comm, ev.message);
-	}
+	printk_ratelimited(KERN_INFO pr_fmt("[%s] [%s] pid=%d comm=%s %s\n"),
+			   ev.category, ev.level, ev.pid, ev.comm, ev.message);
 }
 
 static bool is_virt_module(const char *name)
@@ -333,37 +323,6 @@ static struct kprobe exec_kp = {
 	.symbol_name = "security_bprm_check",
 	.pre_handler = exec_pre_handler,
 };
-
-static int kvm_dev_ioctl_pre_handler(struct kprobe *p, struct pt_regs *regs)
-{
-	unsigned int ioctl = (unsigned int)regs->si;
-
-	if (ioctl == KVM_CREATE_VM)
-		virtmon_record("kvm", "notice", "KVM_CREATE_VM ioctl");
-
-	return 0;
-}
-
-static struct kprobe kvm_dev_ioctl_kp = {
-	.symbol_name = "kvm_dev_ioctl",
-	.pre_handler = kvm_dev_ioctl_pre_handler,
-};
-
-static int kvm_vm_ioctl_pre_handler(struct kprobe *p, struct pt_regs *regs)
-{
-	unsigned int ioctl = (unsigned int)regs->si;
-
-	if (ioctl == KVM_CREATE_VCPU)
-		virtmon_record("kvm", "info", "KVM_CREATE_VCPU ioctl (vcpu_id=%lu)",
-			       (unsigned long)regs->dx);
-
-	return 0;
-}
-
-static struct kprobe kvm_vm_ioctl_kp = {
-	.symbol_name = "kvm_vm_ioctl",
-	.pre_handler = kvm_vm_ioctl_pre_handler,
-};
 #endif
 
 static void virtmon_seq_json_str(struct seq_file *m, const char *s)
@@ -414,17 +373,15 @@ static int status_show(struct seq_file *m, void *v)
 	spin_unlock_irqrestore(&ring_lock, flags);
 
 	seq_printf(m,
-		   "{\"module\":\"nixpit_virtmon\",\"version\":\"%s\",\"dmesg_enabled\":%s,"
+		   "{\"module\":\"nixpit_virtmon\",\"version\":\"%s\","
 		   "\"cpu\":{\"vmx\":%s,\"svm\":%s,\"hypervisor_guest\":%s,\"hw_virt_available\":%s},"
 		   "\"probes\":{\"module_notifier\":%s,\"netdev_notifier\":%s,"
-		   "\"vfs_open_kprobe\":%s,\"exec_kprobe\":%s,"
-		   "\"kvm_dev_ioctl_kprobe\":%s,\"kvm_vm_ioctl_kprobe\":%s},"
+		   "\"vfs_open_kprobe\":%s,\"exec_kprobe\":%s},"
 		   "\"counters\":{\"total\":%llu,\"dropped\":%llu,"
 		   "\"ring_capacity\":%u,\"ring_used\":%u,"
 		   "\"kvm\":%llu,\"module\":%llu,\"network\":%llu,"
 		   "\"process\":%llu,\"system\":%llu}}\n",
 		   VIRTMON_VERSION,
-		   atomic_read(&dmesg_enabled) ? "true" : "false",
 		   cpu_vmx ? "true" : "false",
 		   cpu_svm ? "true" : "false",
 		   cpu_hypervisor ? "true" : "false",
@@ -433,8 +390,6 @@ static int status_show(struct seq_file *m, void *v)
 		   netdev_notifier_active ? "true" : "false",
 		   vfs_open_kprobe_active ? "true" : "false",
 		   exec_kprobe_active ? "true" : "false",
-		   kvm_dev_ioctl_kprobe_active ? "true" : "false",
-		   kvm_vm_ioctl_kprobe_active ? "true" : "false",
 		   tot, drop, VIRTMON_RING_SIZE, used,
 		   k, mod, net, proc, sys);
 	return 0;
@@ -475,8 +430,8 @@ static int events_show(struct seq_file *m, void *v)
 	for (i = 0; i < count; i++) {
 		const struct virtmon_event *ev = &snapshot[i];
 
-		seq_printf(m, "{\"seq\":%llu,\"ts_sec\":%lld,\"ts_nsec\":%u,\"mono_ns\":%llu,",
-			   ev->seq, (long long)ev->ts_sec, ev->ts_nsec, ev->mono_ns);
+		seq_printf(m, "{\"seq\":%llu,\"ts_sec\":%lld,\"ts_nsec\":%u,",
+			   ev->seq, (long long)ev->ts_sec, ev->ts_nsec);
 		seq_puts(m, "\"category\":");
 		virtmon_seq_json_str(m, ev->category);
 		seq_puts(m, ",\"level\":");
@@ -539,12 +494,6 @@ static ssize_t control_write(struct file *file, const char __user *ubuf,
 			       "probe snapshot: vmx=%d svm=%d hv=%d total=%llu ring=%u/%u",
 			       cpu_vmx ? 1 : 0, cpu_svm ? 1 : 0, cpu_hypervisor ? 1 : 0,
 			       tot, used, VIRTMON_RING_SIZE);
-	} else if (strcmp(buf, "dmesg=1") == 0) {
-		atomic_set(&dmesg_enabled, 1);
-		virtmon_record("system", "info", "dmesg logging enabled");
-	} else if (strcmp(buf, "dmesg=0") == 0) {
-		atomic_set(&dmesg_enabled, 0);
-		virtmon_record("system", "info", "dmesg logging disabled");
 	} else {
 		return -EINVAL;
 	}
@@ -584,13 +533,6 @@ static int __init nixpit_virtmon_init(void)
 
 	if (register_kprobe(&exec_kp) == 0)
 		exec_kprobe_active = true;
-
-	/* Best-effort: kvm symbols may be absent if kvm module is not yet loaded */
-	if (register_kprobe(&kvm_dev_ioctl_kp) == 0)
-		kvm_dev_ioctl_kprobe_active = true;
-
-	if (register_kprobe(&kvm_vm_ioctl_kp) == 0)
-		kvm_vm_ioctl_kprobe_active = true;
 #endif
 
 	virtmon_record("system", "notice",
@@ -603,10 +545,6 @@ static int __init nixpit_virtmon_init(void)
 static void __exit nixpit_virtmon_exit(void)
 {
 #if defined(CONFIG_KPROBES) && defined(CONFIG_X86_64)
-	if (kvm_vm_ioctl_kprobe_active)
-		unregister_kprobe(&kvm_vm_ioctl_kp);
-	if (kvm_dev_ioctl_kprobe_active)
-		unregister_kprobe(&kvm_dev_ioctl_kp);
 	if (exec_kprobe_active)
 		unregister_kprobe(&exec_kp);
 	if (vfs_open_kprobe_active)

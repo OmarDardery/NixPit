@@ -1,23 +1,18 @@
 const STATE = "/var/lib/nixpit";
-const KEY = `${STATE}/deploy_key`;
-const REPOS_FILE = `${STATE}/repos.json`;
-const SECRETS_DIR = `${STATE}/secrets`;
 const FLAKE_FILE = `${STATE}/hypervisor.flake`;
-const SSH_ENV = `GIT_SSH_COMMAND=ssh -i ${KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
 
 const logsEl = document.getElementById("logs");
 const repoSelectEl = document.getElementById("repo-select");
 const fileSelectEl = document.getElementById("file-select");
 const rawEditorEl = document.getElementById("raw-editor");
 
-let repos = [];
-let hasKey = false;
+let profiles = [];
 let currentGuests = { containers: {}, vms: {} };
 let envPairs = [];
 let busy = false;
 
 const BUSY_BTN_IDS = [
-  "btn-gc", "btn-pull", "btn-diff", "btn-push",
+  "btn-gc", "btn-sync", "btn-diff", "btn-push",
   "btn-validate", "btn-deploy", "btn-rollback"
 ];
 
@@ -31,6 +26,7 @@ function setBusy(state) {
 
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const log = m => { logsEl.textContent += m; logsEl.scrollTop = logsEl.scrollHeight; };
+
 const run = async (cmd, clear = true) => {
   if (busy) {
     log("\n✖ Another operation is currently running.\n");
@@ -39,7 +35,7 @@ const run = async (cmd, clear = true) => {
   setBusy(true);
   if (clear) logsEl.textContent = `$ ${cmd.join(" ")}\n`;
   try {
-    await cockpit.spawn(cmd, { superuser: "require", err: "out", environ: [SSH_ENV] }).stream(log);
+    await cockpit.spawn(cmd, { superuser: "require", err: "out" }).stream(log);
     log("\n✔ Done.\n");
   } catch (e) {
     log(`\n✖ ${e.message}\n`);
@@ -49,7 +45,6 @@ const run = async (cmd, clear = true) => {
   }
 };
 
-// --- Tabs ---
 function switchTab(tabId) {
   document.querySelectorAll(".tab, .panel").forEach(el => el.classList.remove("active"));
   document.querySelector(`.tab[data-tab="${tabId}"]`).classList.add("active");
@@ -59,10 +54,11 @@ document.querySelectorAll(".tab").forEach(btn => { btn.onclick = () => switchTab
 document.getElementById("btn-clear-logs").onclick = () => { logsEl.textContent = ""; };
 
 function updateOnboarding() {
-  const done = hasKey && repos.length > 0;
-  document.getElementById("onboarding").style.display = done ? "none" : "block";
-  document.getElementById("step-key").style.opacity = hasKey ? "0.5" : "1";
-  document.getElementById("step-repo").style.opacity = repos.length > 0 ? "0.5" : "1";
+  const hasProfiles = profiles.length > 0;
+  const hasCloned = profiles.some(p => p.cloned);
+  document.getElementById("onboarding").style.display = (hasProfiles && hasCloned) ? "none" : "block";
+  document.getElementById("step-profile").style.opacity = hasProfiles ? "0.5" : "1";
+  document.getElementById("step-sync").style.opacity = hasCloned ? "0.5" : "1";
 }
 
 // --- Host Health Strip ---
@@ -85,24 +81,21 @@ async function refreshHealth() {
   refreshGitBadge();
 }
 
-async function refreshGitBadge() {
+function refreshGitBadge() {
   const badge = document.getElementById("stat-git");
-  if (!repoSelectEl.value) {
-    badge.textContent = "no repo";
+  const p = profiles.find(x => x.name === repoSelectEl.value);
+  if (!p) {
+    badge.textContent = "no profile";
     badge.className = "badge badge-unk";
     return;
   }
-  const dir = `${STATE}/repos/${repoSelectEl.value}`;
-  try {
-    const branch = (await cockpit.spawn(["git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD"], { superuser: "require" })).trim();
-    const dirty = (await cockpit.spawn(["git", "-C", dir, "status", "--porcelain"], { superuser: "require" })).trim();
-    const count = dirty ? dirty.split("\n").length : 0;
-    badge.textContent = count ? `${branch} • ${count} modified` : `${branch} • clean`;
-    badge.className = `badge ${count ? "badge-warn" : "badge-ok"}`;
-  } catch {
-    badge.textContent = "git error";
-    badge.className = "badge badge-err";
+  if (!p.cloned) {
+    badge.textContent = `${p.branch} • not synced`;
+    badge.className = "badge badge-warn";
+    return;
   }
+  badge.textContent = `${p.branch} • ${p.commit || "HEAD"} • ${p.dirty ? "dirty" : "clean"}`;
+  badge.className = `badge ${p.dirty ? "badge-warn" : "badge-ok"}`;
 }
 
 document.getElementById("btn-gc").onclick = async () => {
@@ -115,87 +108,100 @@ async function getFlakeUri() {
   return (f && f.trim()) || "path:/etc/nixpit#nixpit";
 }
 
-// --- SSH Key ---
-async function loadKey() {
-  const pub = await cockpit.file(`${KEY}.pub`, { superuser: "require" }).read();
-  hasKey = Boolean(pub && pub.trim());
-  document.getElementById("pub-key").textContent = hasKey
-    ? pub.trim()
-    : 'No key generated yet. Click "Generate Key" to create one.';
-  updateOnboarding();
-}
-
-document.getElementById("btn-gen-key").onclick = async () => {
-  const existing = await cockpit.file(`${KEY}.pub`, { superuser: "require" }).read();
-  if (existing && existing.trim()) {
-    log("SSH deploy key already exists.\n");
-    return loadKey();
-  }
-  await run(["install", "-d", "-m", "0700", STATE]);
-  await run(["ssh-keygen", "-t", "ed25519", "-f", KEY, "-N", "", "-C", "nixpit"], false);
-  loadKey();
-};
-document.getElementById("btn-copy-key").onclick = () => {
-  navigator.clipboard.writeText(document.getElementById("pub-key").textContent);
-  log("✔ Public key copied to clipboard.\n");
-};
-
-// --- Repos ---
-async function loadRepos() {
-  const raw = await cockpit.file(REPOS_FILE, { superuser: "require" }).read();
+// --- Repo Profiles (nixpit-repo) ---
+async function loadProfiles() {
   try {
-    repos = JSON.parse(raw || "[]");
-    if (!Array.isArray(repos)) repos = [];
+    const raw = await cockpit.spawn(["nixpit-repo", "list"], { superuser: "require", err: "out" });
+    profiles = JSON.parse(raw || "[]");
   } catch (e) {
-    log(`✖ Invalid JSON in ${REPOS_FILE}: ${e.message}\n`);
-    repos = [];
+    log(`✖ Failed to load repo profiles: ${e.message}\n`);
+    profiles = [];
   }
 
   const listEl = document.getElementById("repo-list");
-  listEl.innerHTML = repos.length
-    ? repos.map(r => `
+  listEl.innerHTML = profiles.length
+    ? profiles.map(p => `
         <div class="item-row">
-          <span><strong>${esc(r.name)}</strong> — <code>${esc(r.url)}</code></span>
-          <button class="danger" data-rm-repo="${esc(r.name)}">Remove</button>
+          <div class="row between">
+            <span>
+              <strong>${esc(p.name)}</strong>
+              <span class="badge ${p.cloned ? "badge-ok" : "badge-warn"}">${esc(p.branch)}${p.commit ? ` @ ${esc(p.commit)}` : " (not synced)"}</span>
+              — <code>${esc(p.url)}</code>
+            </span>
+            <div class="row">
+              <button data-sync-profile="${esc(p.name)}">Sync</button>
+              <button data-copy-profile-key="${esc(p.name)}">Copy Key</button>
+              <button class="warn" data-rotate-key="${esc(p.name)}">Rotate Key</button>
+              <button class="danger" data-rm-profile="${esc(p.name)}">Remove</button>
+            </div>
+          </div>
+          <div style="margin-top:0.35rem;font-size:0.78rem;color:#999;">
+            SSH Key: <code>${esc(p.pubkey || "Not generated")}</code>
+          </div>
         </div>
       `).join("")
-    : "<p style='color:#888;'>No repositories added yet.</p>";
+    : "<p style='color:#888;'>No repository profiles added yet.</p>";
 
-  listEl.querySelectorAll("[data-rm-repo]").forEach(btn => {
-    btn.onclick = () => removeRepo(btn.dataset.rmRepo);
+  listEl.querySelectorAll("[data-sync-profile]").forEach(btn => {
+    btn.onclick = async () => {
+      await run(["nixpit-repo", "sync", btn.dataset.syncProfile]);
+      await loadProfiles();
+    };
+  });
+  listEl.querySelectorAll("[data-copy-profile-key]").forEach(btn => {
+    btn.onclick = () => {
+      const p = profiles.find(x => x.name === btn.dataset.copyProfileKey);
+      if (p && p.pubkey) {
+        navigator.clipboard.writeText(p.pubkey);
+        log(`✔ Copied SSH public key for profile ${p.name}.\n`);
+      }
+    };
+  });
+  listEl.querySelectorAll("[data-rotate-key]").forEach(btn => {
+    btn.onclick = async () => {
+      const name = btn.dataset.rotateKey;
+      if (!confirm(`Rotate SSH deploy key for profile ${name}? Update the deploy key on your Git host afterward.`)) return;
+      await run(["nixpit-repo", "keygen", name, "--force"]);
+      await loadProfiles();
+    };
+  });
+  listEl.querySelectorAll("[data-rm-profile]").forEach(btn => {
+    btn.onclick = async () => {
+      const name = btn.dataset.rmProfile;
+      if (!confirm(`Remove profile ${name}? Local checkout and key files will be kept unless purged via CLI.`)) return;
+      await run(["nixpit-repo", "remove", name]);
+      await loadProfiles();
+    };
   });
 
-  repoSelectEl.innerHTML = repos.map(r => `<option value="${esc(r.name)}">${esc(r.name)}</option>`).join("");
+  const prev = repoSelectEl.value;
+  repoSelectEl.innerHTML = profiles.map(p => `<option value="${esc(p.name)}">${esc(p.name)} (${esc(p.branch)})</option>`).join("");
+  if (prev && profiles.some(p => p.name === prev)) repoSelectEl.value = prev;
+
   updateOnboarding();
-  if (repos.length) {
+  if (profiles.length) {
     await loadGuestsJson();
     await loadRawFile();
+  } else {
+    currentGuests = { containers: {}, vms: {} };
+    renderGuestCards();
   }
   refreshGitBadge();
 }
 
-async function saveReposList() {
-  await cockpit.file(REPOS_FILE, { superuser: "require" }).replace(JSON.stringify(repos, null, 2));
-  loadRepos();
-}
-
 document.getElementById("btn-add-repo").onclick = async () => {
-  const input = document.getElementById("new-repo-url");
-  const url = input.value.trim();
-  if (!url) return;
-  const name = url.split("/").pop().replace(/\.git$/, "");
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || !/^(git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)/.test(url) || repos.some(r => r.name === name)) return log("Invalid or duplicate GitHub repository.\n");
-  await run(["git", "clone", "--", url, `${STATE}/repos/${name}`]);
-  repos.push({ name, url });
-  input.value = "";
-  await saveReposList();
+  const nameInput = document.getElementById("new-repo-name");
+  const urlInput = document.getElementById("new-repo-url");
+  const branchInput = document.getElementById("new-repo-branch");
+  const name = nameInput.value.trim();
+  const url = urlInput.value.trim();
+  const branch = branchInput.value.trim() || "main";
+  if (!name || !url) return log("✖ Profile Name and Git Repository URL are required.\n");
+  await run(["nixpit-repo", "add", name, url, branch]);
+  nameInput.value = "";
+  urlInput.value = "";
+  await loadProfiles();
 };
-
-async function removeRepo(name) {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || !confirm(`Remove ${name} from NixPit? Local repository files will be retained.`)) return;
-  repos = repos.filter(r => r.name !== name);
-  await saveReposList();
-}
 
 // --- Guests JSON & Live Status ---
 async function loadGuestsJson() {
@@ -257,7 +263,6 @@ async function renderGuestCards() {
   const host = window.location.hostname;
   const cards = [];
 
-  // 1. Containers
   for (const [name, c] of Object.entries(currentGuests.containers)) {
     const unit = `podman-${name}.service`;
     const state = await getUnitState(unit);
@@ -287,7 +292,6 @@ async function renderGuestCards() {
     `);
   }
 
-  // 2. KVM VMs
   for (const [name, vm] of Object.entries(currentGuests.vms)) {
     const vmState = await getVmState(name);
     const vmBadge = vmState === "running"
@@ -314,7 +318,6 @@ async function renderGuestCards() {
     `);
   }
 
-  // 3. Compose Stack Card (if present in active repo)
   if (repoSelectEl.value) {
     const composeFile = await hasComposeFile(repoSelectEl.value);
     if (composeFile) {
@@ -327,7 +330,7 @@ async function renderGuestCards() {
             <strong>Compose: ${esc(repoSelectEl.value)}</strong>
             <span class="badge ${badge}">${esc(state)}</span>
           </div>
-          <div style="font-size:0.78rem;color:#999;margin:0.35rem 0;">File: ${esc(composeFile)} (Podman Compose + Dockerfile)</div>
+          <div style="font-size:0.78rem;color:#999;margin:0.35rem 0;">File: ${esc(composeFile)} (Podman Compose)</div>
           <div class="row">
             <button class="primary" data-restart="${esc(unit)}">Rebuild / Restart</button>
             <button data-logs="${esc(unit)}">Logs</button>
@@ -337,7 +340,7 @@ async function renderGuestCards() {
     }
   }
 
-  containerEl.innerHTML = cards.join("") || "<p style='color:#888;'>No guests declared in this repo yet. Add one below or pick a template.</p>";
+  containerEl.innerHTML = cards.join("") || "<p style='color:#888;'>No guests declared in this profile yet.</p>";
 
   containerEl.querySelectorAll("[data-edit-c]").forEach(b => { b.onclick = () => editContainer(b.dataset.editC); });
   containerEl.querySelectorAll("[data-edit-vm]").forEach(b => { b.onclick = () => editVm(b.dataset.editVm); });
@@ -398,7 +401,7 @@ async function persistGuestsJson() {
   log(`✔ Saved ${path}\n`);
   await loadGuestsJson();
   if (fileSelectEl.value === "guests.json") rawEditorEl.value = text;
-  refreshGitBadge();
+  await loadProfiles();
 }
 
 document.getElementById("btn-save-guest").onclick = async () => {
@@ -425,7 +428,6 @@ document.getElementById("btn-save-guest").onclick = async () => {
   await persistGuestsJson();
 };
 
-// --- Visual VM Editor ---
 document.getElementById("btn-gen-uuid").onclick = () => {
   document.getElementById("vm-uuid").value = crypto.randomUUID();
 };
@@ -470,28 +472,7 @@ document.getElementById("btn-save-vm").onclick = async () => {
 
 document.getElementById("btn-refresh-status").onclick = renderGuestCards;
 
-// --- Templates ---
-document.getElementById("template-select").onchange = async e => {
-  const tpl = e.target.value;
-  e.target.value = "";
-  if (tpl === "klipper") {
-    Object.assign(currentGuests.containers, {
-      klipper: { image: "docker.io/mkuf/klipper:latest", volumes: ["/dev:/dev", "/var/lib/printer_data:/opt/printer_data"], extraOptions: ["--privileged"] },
-      moonraker: { image: "docker.io/mkuf/moonraker:latest", ports: ["7125:7125"], network: "printer-net", volumes: ["/var/lib/printer_data:/opt/printer_data"], dependsOn: ["klipper"] },
-      mainsail: { image: "ghcr.io/mainsail-crew/mainsail:latest", ports: ["8080:80"], network: "printer-net", domain: "printer.home.arpa", dependsOn: ["moonraker"] }
-    });
-  } else if (tpl === "aiostreams") {
-    Object.assign(currentGuests.containers, {
-      aiostreams: { image: "ghcr.io/viren070/aiostreams:latest", ports: ["127.0.0.1:3000:3000"], volumes: ["/var/lib/aiostreams:/app/data"], secretName: "aiostreams" },
-      cloudflared: { image: "docker.io/cloudflare/cloudflared:latest", cmd: ["tunnel", "--no-autoupdate", "run"], secretName: "cloudflared", extraOptions: ["--network=host"], dependsOn: ["aiostreams"] }
-    });
-  } else if (tpl === "vm-debian") {
-    currentGuests.vms["debian-vm"] = { uuid: crypto.randomUUID(), vcpus: 2, memoryGiB: 2, disk: "debian-13.qcow2", network: "default", usbPassthrough: [], active: true };
-  }
-  await persistGuestsJson();
-};
-
-// --- Live USB Scanners (/dev/serial/by-id + lsusb) ---
+// --- USB Scanners ---
 async function scanSerialUsb() {
   const picker = document.getElementById("usb-picker");
   try {
@@ -532,39 +513,42 @@ document.getElementById("btn-add-vm-usb").onclick = () => {
   field.value = field.value ? `${field.value}, ${vp}` : vp;
 };
 
-// --- Secrets & Env Vars ---
-async function writeSecretAtomic(filename, content) {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*\.env$/.test(filename)) {
-    throw new Error("Invalid secret filename");
-  }
-  const proc = cockpit.spawn(
-    [
-      "sh", "-c",
-      'set -eu; umask 077; install -d -m 0700 "$1"; tmp=$(mktemp "$1/.tmp.XXXXXX"); cat > "$tmp"; chmod 600 "$tmp"; mv -f "$tmp" "$1/$2"',
-      "--", SECRETS_DIR, filename
-    ],
-    { superuser: "require", err: "out" }
-  );
-  proc.input(content);
-  await proc;
-}
+// --- SOPS Secrets (nixpit-secrets + sops-nix) ---
+async function loadSecretsOverview() {
+  try {
+    const raw = await cockpit.spawn(["nixpit-secrets", "list"], { superuser: "require", err: "out" });
+    const info = JSON.parse(raw || "{}");
+    document.getElementById("age-pubkey").textContent = info.agePublicKey || "Unavailable";
+    const rt = (info.runtimeActive || []).join(", ") || "none";
+    const sn = (info.sopsNixSecrets || []).join(", ") || "none";
+    document.getElementById("sops-summary").textContent =
+      `Runtime (/run/nixpit/secrets): ${rt} • sops-nix (/run/secrets/nixpit): ${sn}`;
 
-async function loadSecretList() {
-  const out = await cockpit.spawn(["sh", "-c", `install -d -m 0700 "${SECRETS_DIR}" && ls -1 "${SECRETS_DIR}"/*.env 2>/dev/null || true`], { superuser: "require" });
-  const files = out.trim().split("\n").filter(Boolean).map(p => p.split("/").pop());
-  const sel = document.getElementById("secret-select");
-  sel.innerHTML = files.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join("");
-  if (files.length) loadSecretFile(); else { envPairs = []; renderEnvRows(); }
+    const sel = document.getElementById("secret-select");
+    const prev = sel.value;
+    const names = info.hostSecrets || [];
+    sel.innerHTML = names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    if (prev && names.includes(prev)) sel.value = prev;
+    if (names.length) await loadSecretFile();
+    else { envPairs = []; renderEnvRows(); }
+  } catch (e) {
+    document.getElementById("age-pubkey").textContent = `Error: ${e.message}`;
+  }
 }
 
 async function loadSecretFile() {
   const name = document.getElementById("secret-select").value;
   if (!name) return;
-  const raw = await cockpit.file(`${SECRETS_DIR}/${name}`, { superuser: "require" }).read();
-  envPairs = (raw || "").split("\n").filter(l => l.includes("=")).map(l => {
-    const idx = l.indexOf("=");
-    return { k: l.slice(0, idx).trim(), v: l.slice(idx + 1).trim() };
-  });
+  try {
+    const raw = await cockpit.spawn(["nixpit-secrets", "get", name], { superuser: "require", err: "out" });
+    envPairs = (raw || "").split("\n").filter(l => l.includes("=") && !l.trim().startsWith("#")).map(l => {
+      const idx = l.indexOf("=");
+      return { k: l.slice(0, idx).trim(), v: l.slice(idx + 1).trim() };
+    });
+  } catch (e) {
+    log(`✖ Failed to decrypt secret ${name}: ${e.message}\n`);
+    envPairs = [];
+  }
   renderEnvRows();
 }
 
@@ -593,34 +577,65 @@ function renderEnvRows() {
   });
 }
 
+document.getElementById("btn-copy-age").onclick = () => {
+  navigator.clipboard.writeText(document.getElementById("age-pubkey").textContent);
+  log("✔ Copied host Age public key.\n");
+};
+
+document.getElementById("btn-copy-sops-yaml").onclick = async () => {
+  const yaml = await cockpit.spawn(["nixpit-secrets", "sops-config"], { superuser: "require", err: "out" });
+  navigator.clipboard.writeText(yaml);
+  log("✔ Copied .sops.yaml template to clipboard.\n");
+};
+
+document.getElementById("btn-sync-secrets").onclick = async () => {
+  await run(["systemctl", "restart", "nixpit-secrets.service"]);
+  loadSecretsOverview();
+};
+
 document.getElementById("secret-select").onchange = loadSecretFile;
 document.getElementById("btn-add-env-row").onclick = () => { envPairs.push({ k: "", v: "" }); renderEnvRows(); };
-document.getElementById("btn-new-secret").onclick = async () => {
-  const name = document.getElementById("new-secret-name").value.trim().replace(/\.env$/, "");
+
+document.getElementById("btn-new-secret").onclick = () => {
+  const name = document.getElementById("new-secret-name").value.trim().replace(/(\.sops)?\.env$/, "");
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) return log("✖ Invalid secret name.\n");
-  await writeSecretAtomic(`${name}.env`, "");
+  const sel = document.getElementById("secret-select");
+  if (!Array.from(sel.options).some(o => o.value === name)) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  }
+  sel.value = name;
   document.getElementById("new-secret-name").value = "";
-  await loadSecretList();
-  document.getElementById("secret-select").value = `${name}.env`;
-  loadSecretFile();
+  envPairs = [{ k: "", v: "" }];
+  renderEnvRows();
 };
+
 document.getElementById("btn-save-secret").onclick = async () => {
   const name = document.getElementById("secret-select").value;
-  if (!name) return;
+  if (!name) return log("✖ Select or create a secret first.\n");
   const lines = [];
   for (const p of envPairs) {
     const k = p.k.trim();
     if (!k) continue;
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
-      return log(`✖ Invalid environment variable name: ${k}\n`);
-    }
-    if (/[\r\n]/.test(p.v)) {
-      return log(`✖ Value for ${k} cannot contain newlines.\n`);
-    }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) return log(`✖ Invalid environment variable name: ${k}\n`);
+    if (/[\r\n]/.test(p.v)) return log(`✖ Value for ${k} cannot contain newlines.\n`);
     lines.push(`${k}=${p.v}`);
   }
-  await writeSecretAtomic(name, lines.join("\n") + (lines.length ? "\n" : ""));
-  log(`✔ Saved secret ${SECRETS_DIR}/${name} (600)\n`);
+  if (!lines.length) return log("✖ Add at least one KEY=VALUE pair before encrypting.\n");
+  const proc = cockpit.spawn(["nixpit-secrets", "set", name], { superuser: "require", err: "out" });
+  proc.input(lines.join("\n") + "\n");
+  await proc;
+  log(`✔ Encrypted ${name}.sops.env and updated /run/nixpit/secrets/${name}.env\n`);
+  await loadSecretsOverview();
+};
+
+document.getElementById("btn-del-secret").onclick = async () => {
+  const name = document.getElementById("secret-select").value;
+  if (!name || !confirm(`Delete encrypted secret ${name}?`)) return;
+  await run(["nixpit-secrets", "delete", name]);
+  await loadSecretsOverview();
 };
 
 // --- Raw Editor ---
@@ -637,53 +652,25 @@ document.getElementById("btn-save-raw").onclick = async () => {
   await cockpit.file(path, { superuser: "require" }).replace(rawEditorEl.value);
   log(`✔ Saved ${path}\n`);
   if (fileSelectEl.value === "guests.json") loadGuestsJson();
-  refreshGitBadge();
+  await loadProfiles();
 };
 
-// --- Top Toolbar GitOps Actions ---
-document.getElementById("btn-pull").onclick = () =>
-  repoSelectEl.value && run(["git", "-C", `${STATE}/repos/${repoSelectEl.value}`, "pull", "--ff-only"])
-    .then(() => { loadGuestsJson(); loadRawFile(); refreshGitBadge(); });
-
-document.getElementById("btn-diff").onclick = () => {
+// --- Top Toolbar Actions ---
+document.getElementById("btn-sync").onclick = async () => {
   if (!repoSelectEl.value) return;
-  const dir = `${STATE}/repos/${repoSelectEl.value}`;
-  return run([
-    "sh", "-c",
-    'git -C "$1" status --short && git -C "$1" diff && git -C "$1" diff --cached',
-    "--", dir
-  ]);
+  await run(["nixpit-repo", "sync", repoSelectEl.value]);
+  await loadProfiles();
 };
+
+document.getElementById("btn-diff").onclick = () =>
+  repoSelectEl.value && run(["nixpit-repo", "diff", repoSelectEl.value]);
 
 document.getElementById("btn-push").onclick = async () => {
   if (!repoSelectEl.value) return;
-  const dir = `${STATE}/repos/${repoSelectEl.value}`;
-  const msg = document.getElementById("commit-msg").value.trim() || "Update guests via Cockpit";
-  await run(["sh", "-c", `
-    set -eu
-    cd "$1"
-    if [ -n "$(git status --porcelain)" ]; then
-      if ! git diff --cached --quiet; then
-        echo "Refusing to commit a pre-staged index. Review and unstage it first." >&2
-        exit 1
-      fi
-      for file in guests.json compose.yaml docker-compose.yml Dockerfile; do
-        if [ -L "$file" ]; then
-          echo "Refusing symlink: $file" >&2
-          exit 1
-        fi
-        if [ -f "$file" ] || git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
-          git add -- "$file" || exit 1
-        fi
-      done
-      git diff --cached --quiet || git commit -m "$2"
-    else
-      echo "No local changes to commit; pushing any unpushed commits..."
-    fi
-    git push
-  `, "--", dir, msg]);
+  const msg = document.getElementById("commit-msg").value.trim() || "Update NixPit configs";
+  await run(["nixpit-repo", "push", repoSelectEl.value, msg]);
   document.getElementById("commit-msg").value = "";
-  refreshGitBadge();
+  await loadProfiles();
 };
 
 document.getElementById("btn-validate").onclick = async () => {
@@ -696,6 +683,7 @@ document.getElementById("btn-deploy").onclick = async () => {
   await run(["nixos-rebuild", "switch", "--impure", "--flake", flake]);
   renderGuestCards();
   refreshHealth();
+  loadSecretsOverview();
 };
 
 document.getElementById("btn-rollback").onclick = async () => {
@@ -705,18 +693,9 @@ document.getElementById("btn-rollback").onclick = async () => {
   refreshHealth();
 };
 
-// --- Auto-Sync Timer Toggle ---
-async function refreshAutoSync() {
-  const btn = document.getElementById("btn-toggle-autosync");
-  btn.textContent = "Unavailable — transactional sync required";
-  btn.disabled = true;
-}
-
 // Init
-loadKey();
-loadRepos();
-loadSecretList();
+loadProfiles();
+loadSecretsOverview();
 scanSerialUsb();
 scanLsusb();
-refreshAutoSync();
 refreshHealth();

@@ -5,6 +5,8 @@ node --check cockpit/app.js
 node --check cockpit/virtmon/app.js
 bash -n scripts/install.sh
 bash -n scripts/check.sh
+bash -n scripts/nixpit-repo.sh
+bash -n scripts/nixpit-secrets.sh
 python3 - <<'PY'
 import json
 from pathlib import Path
