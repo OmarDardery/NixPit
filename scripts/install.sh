@@ -25,6 +25,9 @@ iface=$(jq -r '.dev // empty' <<< "$route")
 gateway=$(jq -r '.gateway // empty' <<< "$route")
 if [[ -z "$iface" ]]; then echo 'No IPv4 default route found.' >&2; exit 1; fi
 ip_addr=$(ip -j -4 addr show dev "$iface" | jq -r '.[0].addr_info[]? | select(.family == "inet") | .local' | head -n 1)
+if [[ ! "$ip_addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+  echo 'No usable IPv4 address found for Cockpit.' >&2; exit 1
+fi
 mac=$(cat "/sys/class/net/$iface/address")
 printf 'Interface: %s\nIP: %s\nGateway: %s\nMAC: %s\n' "$iface" "$ip_addr" "$gateway" "$mac"
 echo 'For a stable address, reserve this MAC/IP on your router. Existing network settings are preserved.'
@@ -40,13 +43,23 @@ tee /etc/nixpit/flake.nix >/dev/null <<FLAKE
   outputs = { nixpkgs, nixpit, ... }: {
     nixosConfigurations.nixpit = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
-      modules = [ /etc/nixos/configuration.nix nixpit.nixosModules.default ];
+      modules = [
+        /etc/nixos/configuration.nix
+        nixpit.nixosModules.default
+        { services.cockpit.allowed-origins = [ "https://$ip_addr:9090" ]; }
+      ];
     };
   };
 }
 FLAKE
 printf 'path:/etc/nixpit#nixpit\n' | tee /var/lib/nixpit/hypervisor.flake >/dev/null
-nix --extra-experimental-features 'nix-command flakes' flake lock path:/etc/nixpit
+if [[ -f /etc/nixpit/flake.lock ]]; then
+  # Re-running the installer must refresh the appliance input, not silently
+  # keep the old revision from the previously generated wrapper lock.
+  nix --extra-experimental-features 'nix-command flakes' flake update nixpit --refresh --flake path:/etc/nixpit
+else
+  nix --extra-experimental-features 'nix-command flakes' flake lock path:/etc/nixpit
+fi
 nixos-rebuild build --impure --flake path:/etc/nixpit#nixpit
 nixos-rebuild switch --impure --flake path:/etc/nixpit#nixpit
 printf 'Cockpit: https://%s:9090\n' "$ip_addr"
