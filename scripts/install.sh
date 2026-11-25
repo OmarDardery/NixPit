@@ -6,7 +6,8 @@ if (( EUID != 0 )); then
   exit 1
 fi
 # Preserve existing NIX_CONFIG and enable features for all child processes.
-export NIX_CONFIG="$(printf '%s\n%s' "${NIX_CONFIG:-}" 'extra-experimental-features = nix-command flakes')"
+NIX_CONFIG="$(printf '%s\n%s' "${NIX_CONFIG:-}" 'extra-experimental-features = nix-command flakes')"
+export NIX_CONFIG
 source_uri="${1:-github:OmarDardery/NixPit}"
 if [[ ! -f /etc/nixos/configuration.nix ]]; then
   echo 'Existing /etc/nixos/configuration.nix required; import nixosModules.default manually for custom flakes.' >&2
