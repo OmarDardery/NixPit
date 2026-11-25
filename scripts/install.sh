@@ -9,14 +9,14 @@ if [[ -f /etc/nixos/flake.nix ]]; then
   echo 'Existing flake detected. Import NixPit as a module instead of replacing your host flake.' >&2
   exit 1
 fi
-if [[ ! "$source_uri" =~ ^github:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_./-]+)?$ ]]; then
-  echo 'Expected a GitHub flake URI without a fragment.' >&2; exit 1
+if [[ ! "$source_uri" =~ ^(github:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_./-]+)?|path:/[a-zA-Z0-9_./-]+)$ ]]; then
+  echo 'Expected a GitHub or absolute path flake URI without a fragment.' >&2; exit 1
 fi
 route=$(ip -j -4 route show default | jq -c '.[0] // {}')
 iface=$(jq -r '.dev // empty' <<< "$route")
 gateway=$(jq -r '.gateway // empty' <<< "$route")
 if [[ -z "$iface" ]]; then echo 'No IPv4 default route found.' >&2; exit 1; fi
-ip_addr=$(ip -j -4 addr show dev "$iface" | jq -r '.[0].addr_info[0].local // empty')
+ip_addr=$(ip -j -4 addr show dev "$iface" | jq -r '.[0].addr_info[]? | select(.family == "inet") | .local' | head -n 1)
 mac=$(cat "/sys/class/net/$iface/address")
 printf 'Interface: %s\nIP: %s\nGateway: %s\nMAC: %s\n' "$iface" "$ip_addr" "$gateway" "$mac"
 echo 'For a stable address, reserve this MAC/IP on your router. Existing network settings are preserved.'

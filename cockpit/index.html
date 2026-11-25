@@ -108,7 +108,7 @@
         <div><label>Volumes (comma-separated, host:container)</label><input id="f-volumes" class="full" placeholder="/var/lib/app:/data" /></div>
         <div><label>Custom Podman Network (optional)</label><input id="f-network" class="full" placeholder="e.g. printer-net or media-net" /></div>
         <div><label>Reverse Proxy Domain (Auto-Caddy, optional)</label><input id="f-domain" class="full" placeholder="e.g. printer.home.arpa or app.example.com" /></div>
-        <div><label>Secret Name (loads /var/lib/homelab/secrets/&lt;name&gt;.env)</label><input id="f-secret" class="full" placeholder="e.g. aiostreams" /></div>
+        <div><label>Secret Name (loads /var/lib/nixpit/secrets/&lt;name&gt;.env)</label><input id="f-secret" class="full" placeholder="e.g. aiostreams" /></div>
         <div>
           <label>Serial USB Passthrough (Live <code>/dev/serial/by-id</code>)</label>
           <div class="row">
@@ -167,7 +167,7 @@
         <button id="btn-save-secret" class="success">Save Secret (chmod 600)</button>
       </div>
       <p style="color: var(--muted); font-size: 0.85rem; margin-top: 0;">
-        Stored strictly on this server in <code>/var/lib/homelab/secrets/</code> — never committed to Git.
+        Stored strictly on this server in <code>/var/lib/nixpit/secrets/</code> — never committed to Git.
       </p>
       <div id="env-rows"></div>
       <button id="btn-add-env-row" style="margin-top: 0.6rem;">+ Add Variable</button>

@@ -5,3 +5,11 @@ result-*
 !.env.example
 secrets/
 *.qcow2
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.o
+Module.symvers
+modules.order
+.*.cmd

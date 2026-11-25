@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>NixPit Virtualization Monitor</title>
+  <script src="../base1/cockpit.js"></script>
+  <style>
+    :root { --bg: #181818; --card: #212121; --border: #333; --text: #eee; --muted: #999; --blue: #0066cc; --green: #2e7d32; --red: #b71c1c; --amber: #b26a00; }
+    body { font-family: system-ui, sans-serif; padding: 1.25rem; background: var(--bg); color: var(--text); max-width: 1240px; margin: 0 auto; }
+    h2, h3 { margin-top: 0; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+    .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    .between { justify-content: space-between; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.65rem; margin-bottom: 1rem; }
+    .metric { background: #161616; border: 1px solid var(--border); border-radius: 6px; padding: 0.7rem 0.85rem; }
+    .metric-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; }
+    .metric-val { font-size: 1.35rem; font-weight: 700; margin-top: 0.2rem; }
+    input, select { padding: 0.42rem 0.55rem; background: #111; color: #fff; border: 1px solid #444; border-radius: 4px; font-family: inherit; font-size: 0.85rem; }
+    button { padding: 0.42rem 0.8rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; color: #fff; background: #3a3a3a; font-size: 0.82rem; }
+    button:hover:not(:disabled) { filter: brightness(1.15); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .primary { background: var(--blue); } .success { background: var(--green); } .danger { background: var(--red); } .warn { background: var(--amber); }
+    .badge { padding: 0.16rem 0.5rem; border-radius: 10px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; display: inline-block; }
+    .badge-ok { background: #1b5e20; color: #c8e6c9; }
+    .badge-err { background: #7f1d1d; color: #fecaca; }
+    .badge-warn { background: #78350f; color: #fde68a; }
+    .badge-info { background: #1e3a8a; color: #bfdbfe; }
+    .badge-unk { background: #374151; color: #d1d5db; }
+    .filter-btn.active { background: var(--blue); }
+    .probe-strip { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; font-size: 0.8rem; }
+    .table-wrap { max-height: 460px; overflow-y: auto; border: 1px solid var(--border); border-radius: 4px; background: #111; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid #262626; vertical-align: top; }
+    th { position: sticky; top: 0; background: #1a1a1a; color: var(--muted); font-size: 0.75rem; text-transform: uppercase; }
+    td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre { background: #0d0d0d; border: 1px solid var(--border); padding: 0.75rem; height: 420px; overflow-y: auto; font-size: 0.8rem; margin: 0; white-space: pre-wrap; word-break: break-word; }
+    .error-banner { display: none; background: #3b1212; border: 1px solid var(--red); color: #fecaca; border-radius: 6px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <div class="row between" style="margin-bottom: 0.85rem;">
+    <div class="row" style="gap: 0.75rem;">
+      <h2 style="margin: 0;">Kernel Virtualization Monitor</h2>
+      <span id="mod-badge" class="badge badge-unk">Checking...</span>
+      <span id="cpu-badge" class="badge badge-unk">CPU: ...</span>
+    </div>
+    <div class="row">
+      <button id="btn-load-mod" class="primary">Load Module</button>
+      <button id="btn-probe" class="success">Run Probe</button>
+      <button id="btn-clear" class="danger">Clear Buffer</button>
+      <button id="btn-live" class="warn">Live (2s)</button>
+      <button id="btn-refresh">Refresh</button>
+    </div>
+  </div>
+
+  <div id="error-banner" class="error-banner"></div>
+
+  <div class="card">
+    <div class="row between" style="margin-bottom: 0.5rem;">
+      <strong>Kernel Probes &amp; Virtualization Modules</strong>
+      <span id="ring-info" style="font-size: 0.8rem; color: var(--muted);">Ring: ...</span>
+    </div>
+    <div id="probe-strip" class="probe-strip" style="margin-bottom: 0.55rem;"></div>
+    <div id="loaded-mods" class="probe-strip"></div>
+  </div>
+
+  <div class="metrics">
+    <div class="metric"><div class="metric-label">Total Events</div><div class="metric-val" id="m-total">0</div></div>
+    <div class="metric"><div class="metric-label">KVM / Devices</div><div class="metric-val" id="m-kvm">0</div></div>
+    <div class="metric"><div class="metric-label">Kernel Modules</div><div class="metric-val" id="m-module">0</div></div>
+    <div class="metric"><div class="metric-label">Virt Network</div><div class="metric-val" id="m-network">0</div></div>
+    <div class="metric"><div class="metric-label">Virt Processes</div><div class="metric-val" id="m-process">0</div></div>
+    <div class="metric"><div class="metric-label">Ring Usage</div><div class="metric-val" id="m-ring">0 / 512</div></div>
+  </div>
+
+  <div class="card">
+    <div class="row between" style="margin-bottom: 0.7rem;">
+      <div class="row">
+        <select id="log-source" title="Log Source">
+          <option value="ring">Kernel Module Ring (/proc/nixpit_virtmon/events)</option>
+          <option value="dmesg">Kernel Journal (journalctl -k)</option>
+          <option value="services">Libvirt &amp; NixVirt Services</option>
+        </select>
+        <div id="cat-filters" class="row">
+          <button class="filter-btn active" data-cat="all">All</button>
+          <button class="filter-btn" data-cat="kvm">kvm</button>
+          <button class="filter-btn" data-cat="module">module</button>
+          <button class="filter-btn" data-cat="network">network</button>
+          <button class="filter-btn" data-cat="process">process</button>
+          <button class="filter-btn" data-cat="system">system</button>
+        </div>
+      </div>
+      <div class="row">
+        <input id="search-input" placeholder="Filter message, comm, PID..." size="24" />
+        <button id="btn-export-json">Export JSON</button>
+        <button id="btn-export-log">Export Log</button>
+      </div>
+    </div>
+
+    <div id="ring-view" class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Seq</th>
+            <th>Timestamp (UTC)</th>
+            <th>Category</th>
+            <th>Level</th>
+            <th>PID</th>
+            <th>Process</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody id="events-body">
+          <tr><td colspan="7" style="color: var(--muted);">Loading kernel events...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <pre id="raw-log-view" style="display: none;"></pre>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

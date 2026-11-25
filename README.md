@@ -6,7 +6,7 @@ A declarative, GitOps-driven NixOS hypervisor appliance with Cockpit as its sing
 
 ## Architecture
 
-- **NixPit host:** NixOS, KVM/Libvirt via NixVirt, rootful Podman, Podman Compose, Caddy, Cockpit Machines/Podman, a custom NixPit Workloads plugin and ble.sh.
+- **NixPit host:** NixOS, KVM/Libvirt via NixVirt (with `virbr0` NAT network, `default` storage pool, nested virtualization, `virtiofsd` and `swtpm`), rootful Podman, Podman Compose, Caddy, Cockpit Machines/Podman, custom NixPit Workloads & Virtualization Monitor plugins, `nixpit_virtmon.ko` kernel monitor module, and ble.sh.
 - **Independent workload repositories:** plain `guests.json`, `compose.yaml` or `docker-compose.yml`, and Dockerfiles. No NixOS boilerplate. See [template](templates/guests/).
 - **Local state:** `/var/lib/nixpit` stores registered repositories, deploy key, local environment files and host flake reference. Secrets and workload data do not belong in Git or the Nix store.
 
@@ -24,10 +24,11 @@ Open `https://<server-ip>:9090` on a trusted LAN, sign in as an existing adminis
 
 ## Repository layout
 
-- `flake.nix` — installer, exported NixOS module and checks
-- `modules/host.nix` — platform services and experimental sync
-- `modules/guest-loader.nix` — workload translation
-- `cockpit/` — custom control plane
+- `flake.nix` — installer, kernel monitor package, exported NixOS module, checks and VM test
+- `kernel/nixpit-virtmon/` — out-of-tree Linux kernel module (`nixpit_virtmon.ko`) monitoring KVM, module, virtual network and virtualization process activity
+- `modules/host.nix` — platform services, KVM/Libvirt virtualization and kernel monitor wiring
+- `modules/guest-loader.nix` — validated workload translation
+- `cockpit/` — custom control plane (`homelab-gitops` and `virtmon` Virtualization Monitor panel)
 - `scripts/install.sh` — bootstrap
 - `templates/guests/` — example external workload repository (not automatically deployed)
 - `docs/architecture.md` — intended behavior, gaps and release gates

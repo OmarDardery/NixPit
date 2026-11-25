@@ -1,0 +1,9 @@
+{
+  "version": 0,
+  "tools": {
+    "nixpit-virtmon": {
+      "label": "Virtualization Monitor",
+      "path": "index.html"
+    }
+  }
+}

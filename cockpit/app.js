@@ -14,13 +14,39 @@ let repos = [];
 let hasKey = false;
 let currentGuests = { containers: {}, vms: {} };
 let envPairs = [];
+let busy = false;
+
+const BUSY_BTN_IDS = [
+  "btn-gc", "btn-pull", "btn-diff", "btn-push",
+  "btn-validate", "btn-deploy", "btn-rollback"
+];
+
+function setBusy(state) {
+  busy = state;
+  BUSY_BTN_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = state;
+  });
+}
 
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const log = m => { logsEl.textContent += m; logsEl.scrollTop = logsEl.scrollHeight; };
-const run = (cmd, clear = true) => {
+const run = async (cmd, clear = true) => {
+  if (busy) {
+    log("\n✖ Another operation is currently running.\n");
+    throw new Error("Operation already in progress");
+  }
+  setBusy(true);
   if (clear) logsEl.textContent = `$ ${cmd.join(" ")}\n`;
-  return cockpit.spawn(cmd, { superuser: "require", err: "out", environ: [SSH_ENV] })
-    .stream(log).then(() => log("\n✔ Done.\n")).catch(e => { log(`\n✖ ${e.message}\n`); throw e; });
+  try {
+    await cockpit.spawn(cmd, { superuser: "require", err: "out", environ: [SSH_ENV] }).stream(log);
+    log("\n✔ Done.\n");
+  } catch (e) {
+    log(`\n✖ ${e.message}\n`);
+    throw e;
+  } finally {
+    setBusy(false);
+  }
 };
 
 // --- Tabs ---
@@ -100,7 +126,13 @@ async function loadKey() {
 }
 
 document.getElementById("btn-gen-key").onclick = async () => {
-  await run(["sh", "-c", `test ! -e ${KEY} && ssh-keygen -t ed25519 -f ${KEY} -N "" -C "nixpit"`]);
+  const existing = await cockpit.file(`${KEY}.pub`, { superuser: "require" }).read();
+  if (existing && existing.trim()) {
+    log("SSH deploy key already exists.\n");
+    return loadKey();
+  }
+  await run(["install", "-d", "-m", "0700", STATE]);
+  await run(["ssh-keygen", "-t", "ed25519", "-f", KEY, "-N", "", "-C", "nixpit"], false);
   loadKey();
 };
 document.getElementById("btn-copy-key").onclick = () => {
@@ -111,7 +143,13 @@ document.getElementById("btn-copy-key").onclick = () => {
 // --- Repos ---
 async function loadRepos() {
   const raw = await cockpit.file(REPOS_FILE, { superuser: "require" }).read();
-  repos = JSON.parse(raw || "[]");
+  try {
+    repos = JSON.parse(raw || "[]");
+    if (!Array.isArray(repos)) repos = [];
+  } catch (e) {
+    log(`✖ Invalid JSON in ${REPOS_FILE}: ${e.message}\n`);
+    repos = [];
+  }
 
   const listEl = document.getElementById("repo-list");
   listEl.innerHTML = repos.length
@@ -184,6 +222,28 @@ async function getUnitState(unit) {
   }
 }
 
+async function getVmState(name) {
+  try {
+    const out = await cockpit.spawn(["virsh", "domstate", name], { superuser: "require", err: "ignore" });
+    return out.trim() || "unknown";
+  } catch {
+    return "not defined";
+  }
+}
+
+function parsePublicHostPort(portSpec) {
+  const addrPart = String(portSpec || "").split("/")[0];
+  const v6 = addrPart.match(/^\[([^\]]+)\]:(\d+):(\d+)$/);
+  if (v6) {
+    if (v6[1] === "::1") return null;
+    return v6[2];
+  }
+  const parts = addrPart.split(":");
+  if (parts.length === 2) return parts[0];
+  if (parts.length === 3 && parts[0] !== "127.0.0.1" && parts[0] !== "::1") return parts[1];
+  return null;
+}
+
 async function hasComposeFile(repoName) {
   for (const f of ["docker-compose.yml", "compose.yaml"]) {
     const content = await cockpit.file(`${STATE}/repos/${repoName}/${f}`, { superuser: "require" }).read();
@@ -202,10 +262,11 @@ async function renderGuestCards() {
     const unit = `podman-${name}.service`;
     const state = await getUnitState(unit);
     const badge = state === "active" ? "badge-ok" : (state === "failed" ? "badge-err" : "badge-unk");
-    const firstPort = (c.ports || []).find(p => !p.startsWith("127.0.0.1:"));
+    const firstPort = (c.ports || []).map(parsePublicHostPort).find(Boolean);
+    const isLocalDomain = /\.(local|lan|home\.arpa)$/i.test(c.domain || "");
     const uiUrl = c.domain
-      ? `http://${c.domain}`
-      : (firstPort ? `http://${host}:${firstPort.split(":")[0]}` : null);
+      ? `${isLocalDomain ? "http" : "https"}://${c.domain}`
+      : (firstPort ? `http://${host}:${firstPort}` : null);
     cards.push(`
       <div class="card" style="margin:0;background:#181818;">
         <div class="row between">
@@ -219,7 +280,7 @@ async function renderGuestCards() {
           <button data-edit-c="${esc(name)}">Edit</button>
           <button data-restart="${esc(unit)}">Restart</button>
           <button data-logs="${esc(unit)}">Logs</button>
-          ${uiUrl ? `<a href="${esc(uiUrl)}" target="_blank" style="color:#6cb4ee;font-size:0.82rem;">Open ↗</a>` : ""}
+          ${uiUrl ? `<a href="${esc(uiUrl)}" target="_blank" rel="noopener noreferrer" style="color:#6cb4ee;font-size:0.82rem;">Open ↗</a>` : ""}
           <button class="danger" data-del-type="containers" data-del-name="${esc(name)}">Del</button>
         </div>
       </div>
@@ -228,18 +289,25 @@ async function renderGuestCards() {
 
   // 2. KVM VMs
   for (const [name, vm] of Object.entries(currentGuests.vms)) {
+    const vmState = await getVmState(name);
+    const vmBadge = vmState === "running"
+      ? "badge-ok"
+      : (vmState === "shut off" ? "badge-unk" : "badge-warn");
     cards.push(`
       <div class="card" style="margin:0;background:#181818;">
         <div class="row between">
           <strong>VM: ${esc(name)}</strong>
-          <span class="badge badge-unk">${esc(vm.vcpus || 2)} vCPU • ${esc(vm.memoryGiB || 2)} GiB</span>
+          <span class="badge ${vmBadge}">${esc(vmState)}</span>
         </div>
         <div style="font-size:0.78rem;color:#999;margin:0.35rem 0;">
-          Disk: ${esc(vm.disk)} • Net: ${esc(vm.network || "default")}
+          ${esc(vm.vcpus || 2)} vCPU • ${esc(vm.memoryGiB || 2)} GiB • Disk: ${esc(vm.disk)} • Net: ${esc(vm.network || "default")}
           ${(vm.usbPassthrough || []).length ? ` • USB: ${esc(vm.usbPassthrough.join(", "))}` : ""}
         </div>
         <div class="row">
-          <button data-edit-vm="${esc(name)}">Edit VM</button>
+          <button data-edit-vm="${esc(name)}">Edit</button>
+          <button class="success" data-vm-action="start" data-vm-name="${esc(name)}">Start</button>
+          <button data-vm-action="shutdown" data-vm-name="${esc(name)}">Shutdown</button>
+          <button class="warn" data-vm-action="destroy" data-vm-name="${esc(name)}">Force Off</button>
           <button class="danger" data-del-type="vms" data-del-name="${esc(name)}">Del</button>
         </div>
       </div>
@@ -278,6 +346,15 @@ async function renderGuestCards() {
   });
   containerEl.querySelectorAll("[data-logs]").forEach(b => {
     b.onclick = () => run(["journalctl", "-u", b.dataset.logs, "-n", "60", "--no-pager"]);
+  });
+  containerEl.querySelectorAll("[data-vm-action]").forEach(b => {
+    b.onclick = async () => {
+      const action = b.dataset.vmAction;
+      const vmName = b.dataset.vmName;
+      if (action === "destroy" && !confirm(`Force power off VM ${vmName}?`)) return;
+      await run(["virsh", action, vmName]);
+      renderGuestCards();
+    };
   });
   containerEl.querySelectorAll("[data-del-name]").forEach(b => {
     b.onclick = async () => {
@@ -327,22 +404,24 @@ async function persistGuestsJson() {
 document.getElementById("btn-save-guest").onclick = async () => {
   const name = document.getElementById("f-name").value.trim();
   const image = document.getElementById("f-image").value.trim();
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(name) || !image) return log("✖ Service Name and OCI Image are required.\n");
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || !image) return log("✖ Service Name and OCI Image are required.\n");
   const split = id => document.getElementById(id).value.split(",").map(s => s.trim()).filter(Boolean);
   const net = document.getElementById("f-network").value.trim();
   const domain = document.getElementById("f-domain").value.trim();
   const secret = document.getElementById("f-secret").value.trim();
 
-  currentGuests.containers[name] = {
-    ...currentGuests.containers[name],
+  const updated = {
+    ...(currentGuests.containers[name] || {}),
     image,
     ports: split("f-ports"),
     volumes: split("f-volumes"),
-    network: net,
-    domain,
-    secretName: secret || name,
     usbPassthrough: split("f-usb")
   };
+  if (net) updated.network = net; else delete updated.network;
+  if (domain) updated.domain = domain; else delete updated.domain;
+  if (secret) updated.secretName = secret; else delete updated.secretName;
+
+  currentGuests.containers[name] = updated;
   await persistGuestsJson();
 };
 
@@ -354,16 +433,34 @@ document.getElementById("btn-gen-uuid").onclick = () => {
 document.getElementById("btn-save-vm").onclick = async () => {
   const name = document.getElementById("vm-name").value.trim();
   const disk = document.getElementById("vm-disk").value.trim();
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(name) || !disk) return log("✖ VM Name and Disk Volume are required.\n");
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || !disk || disk.includes("..")) {
+    return log("✖ Valid VM Name and Disk Volume are required.\n");
+  }
   const uuid = document.getElementById("vm-uuid").value.trim() || crypto.randomUUID();
+  if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(uuid)) {
+    return log("✖ Invalid VM UUID format.\n");
+  }
+  const vcpus = parseInt(document.getElementById("vm-vcpus").value, 10);
+  const memoryGiB = parseInt(document.getElementById("vm-mem").value, 10);
+  if (!Number.isInteger(vcpus) || vcpus < 1 || !Number.isInteger(memoryGiB) || memoryGiB < 1) {
+    return log("✖ vCPUs and Memory GiB must be positive integers.\n");
+  }
+  const net = document.getElementById("vm-net").value.trim() || "default";
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(net)) {
+    return log("✖ Invalid VM network/bridge name.\n");
+  }
   const usb = document.getElementById("vm-usb").value.split(",").map(s => s.trim()).filter(Boolean);
+  if (usb.some(vp => !/^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$/.test(vp))) {
+    return log("✖ USB passthrough entries must use vendor:product hex format (e.g. 0bda:8812).\n");
+  }
 
   currentGuests.vms[name] = {
+    ...(currentGuests.vms[name] || {}),
     uuid,
-    vcpus: parseInt(document.getElementById("vm-vcpus").value, 10) || 2,
-    memoryGiB: parseInt(document.getElementById("vm-mem").value, 10) || 2,
+    vcpus,
+    memoryGiB,
     disk,
-    network: document.getElementById("vm-net").value.trim() || "default",
+    network: net,
     usbPassthrough: usb,
     active: currentGuests.vms[name]?.active ?? true
   };
@@ -436,8 +533,24 @@ document.getElementById("btn-add-vm-usb").onclick = () => {
 };
 
 // --- Secrets & Env Vars ---
+async function writeSecretAtomic(filename, content) {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*\.env$/.test(filename)) {
+    throw new Error("Invalid secret filename");
+  }
+  const proc = cockpit.spawn(
+    [
+      "sh", "-c",
+      'set -eu; umask 077; install -d -m 0700 "$1"; tmp=$(mktemp "$1/.tmp.XXXXXX"); cat > "$tmp"; chmod 600 "$tmp"; mv -f "$tmp" "$1/$2"',
+      "--", SECRETS_DIR, filename
+    ],
+    { superuser: "require", err: "out" }
+  );
+  proc.input(content);
+  await proc;
+}
+
 async function loadSecretList() {
-  const out = await cockpit.spawn(["sh", "-c", `mkdir -p ${SECRETS_DIR} && ls -1 ${SECRETS_DIR}/*.env 2>/dev/null || true`], { superuser: "require" });
+  const out = await cockpit.spawn(["sh", "-c", `install -d -m 0700 "${SECRETS_DIR}" && ls -1 "${SECRETS_DIR}"/*.env 2>/dev/null || true`], { superuser: "require" });
   const files = out.trim().split("\n").filter(Boolean).map(p => p.split("/").pop());
   const sel = document.getElementById("secret-select");
   sel.innerHTML = files.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join("");
@@ -484,9 +597,8 @@ document.getElementById("secret-select").onchange = loadSecretFile;
 document.getElementById("btn-add-env-row").onclick = () => { envPairs.push({ k: "", v: "" }); renderEnvRows(); };
 document.getElementById("btn-new-secret").onclick = async () => {
   const name = document.getElementById("new-secret-name").value.trim().replace(/\.env$/, "");
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) return;
-  await cockpit.spawn(["touch", `${SECRETS_DIR}/${name}.env`], { superuser: "require" });
-  await cockpit.spawn(["chmod", "600", `${SECRETS_DIR}/${name}.env`], { superuser: "require" });
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) return log("✖ Invalid secret name.\n");
+  await writeSecretAtomic(`${name}.env`, "");
   document.getElementById("new-secret-name").value = "";
   await loadSecretList();
   document.getElementById("secret-select").value = `${name}.env`;
@@ -495,9 +607,19 @@ document.getElementById("btn-new-secret").onclick = async () => {
 document.getElementById("btn-save-secret").onclick = async () => {
   const name = document.getElementById("secret-select").value;
   if (!name) return;
-  const content = envPairs.filter(p => p.k.trim()).map(p => `${p.k.trim()}=${p.v}`).join("\n") + "\n";
-  await cockpit.file(`${SECRETS_DIR}/${name}`, { superuser: "require" }).replace(content);
-  await cockpit.spawn(["chmod", "600", `${SECRETS_DIR}/${name}`], { superuser: "require" });
+  const lines = [];
+  for (const p of envPairs) {
+    const k = p.k.trim();
+    if (!k) continue;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
+      return log(`✖ Invalid environment variable name: ${k}\n`);
+    }
+    if (/[\r\n]/.test(p.v)) {
+      return log(`✖ Value for ${k} cannot contain newlines.\n`);
+    }
+    lines.push(`${k}=${p.v}`);
+  }
+  await writeSecretAtomic(name, lines.join("\n") + (lines.length ? "\n" : ""));
   log(`✔ Saved secret ${SECRETS_DIR}/${name} (600)\n`);
 };
 
@@ -523,8 +645,15 @@ document.getElementById("btn-pull").onclick = () =>
   repoSelectEl.value && run(["git", "-C", `${STATE}/repos/${repoSelectEl.value}`, "pull", "--ff-only"])
     .then(() => { loadGuestsJson(); loadRawFile(); refreshGitBadge(); });
 
-document.getElementById("btn-diff").onclick = () =>
-  repoSelectEl.value && run(["git", "-C", `${STATE}/repos/${repoSelectEl.value}`, "diff"]);
+document.getElementById("btn-diff").onclick = () => {
+  if (!repoSelectEl.value) return;
+  const dir = `${STATE}/repos/${repoSelectEl.value}`;
+  return run([
+    "sh", "-c",
+    'git -C "$1" status --short && git -C "$1" diff && git -C "$1" diff --cached',
+    "--", dir
+  ]);
+};
 
 document.getElementById("btn-push").onclick = async () => {
   if (!repoSelectEl.value) return;
