@@ -1,7 +1,0 @@
-services:
-  custom-app:
-    build: .
-    container_name: custom-app
-    ports:
-      - "8090:8080"
-    restart: unless-stopped

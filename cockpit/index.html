@@ -18,10 +18,10 @@
       </div>
       <div class="row">
         <select id="repo-select" title="Active Repo Profile"></select>
-        <button id="btn-sync">Sync</button>
+        <button id="btn-sync">Pull / Sync</button>
         <button id="btn-diff">Diff</button>
         <input id="commit-msg" placeholder="Commit message..." size="16" />
-        <button id="btn-push">Push</button>
+        <button id="btn-push">Commit &amp; Push</button>
         <button id="btn-validate" class="warn">Validate</button>
         <button id="btn-deploy" class="primary">Deploy</button>
         <button id="btn-rollback" class="danger">Rollback</button>
@@ -43,8 +43,8 @@
       <h3>Get Started</h3>
       <ol class="muted" style="margin: 0; padding-left: 1.2rem; line-height: 1.85;">
         <li id="step-profile">Open <strong>Profiles</strong> to add a repository and copy its generated SSH deploy key.</li>
-        <li id="step-sync">Click <strong>Sync</strong> to pull <code>guests.json</code>, Compose stacks, and SOPS secrets.</li>
-        <li>Configure secrets under <strong>Secrets</strong>, run <strong>Validate</strong>, then click <strong>Deploy</strong>.</li>
+        <li id="step-sync">Click <strong>Pull / Sync</strong> to clone <code>.nix</code> modules, <code>compose.yaml</code>, <code>Dockerfile</code>, and SOPS secrets.</li>
+        <li>Add workloads &amp; env vars (encrypted via <code>sops-nix</code>), <strong>Commit &amp; Push</strong>, then click <strong>Deploy</strong>.</li>
       </ol>
     </div>
 
@@ -59,14 +59,14 @@
     <section id="tab-guests" class="panel active">
       <div class="card">
         <div class="row between" style="margin-bottom: 0.8rem;">
-          <h3>Declared Workloads</h3>
+          <h3>Declared Workloads (<code>nix/*.nix</code> · Compose · Dockerfile)</h3>
           <button id="btn-refresh-status" class="sm">Refresh</button>
         </div>
         <div id="guest-cards" class="grid"></div>
       </div>
 
       <div class="card">
-        <h3>Container Declaration (<code>guests.json</code>)</h3>
+        <h3>Container Declaration (<code>nix/&lt;name&gt;.nix</code> + SOPS Env Vars)</h3>
         <div class="form-grid">
           <div><label>Service Name</label><input id="f-name" class="full" placeholder="homeassistant" /></div>
           <div><label>OCI Image</label><input id="f-image" class="full" placeholder="ghcr.io/home-assistant/home-assistant:stable" /></div>
@@ -74,7 +74,7 @@
           <div><label>Volumes (comma-separated)</label><input id="f-volumes" class="full" placeholder="/var/lib/app:/data" /></div>
           <div><label>Podman Network (optional)</label><input id="f-network" class="full" placeholder="app-net" /></div>
           <div><label>Caddy Domain (optional)</label><input id="f-domain" class="full" placeholder="app.home.arpa" /></div>
-          <div><label>Secret Name (SOPS)</label><input id="f-secret" class="full" placeholder="app" /></div>
+          <div><label>Secret Name (defaults to Service Name)</label><input id="f-secret" class="full" placeholder="app" /></div>
           <div>
             <label>Serial USB (<code>/dev/serial/by-id</code>)</label>
             <div class="row">
@@ -84,14 +84,24 @@
             </div>
             <input id="f-usb" class="full" placeholder="/dev/serial/by-id/..." style="margin-top:0.4rem;" />
           </div>
+          <div class="span-2">
+            <div class="row between" style="margin-bottom: 0.4rem;">
+              <label style="margin:0;">Environment Variables (encrypted with SOPS into <code>secrets/&lt;secret&gt;.sops.env</code>)</label>
+              <button id="btn-add-container-env" type="button" class="sm">+ Add Env Var</button>
+            </div>
+            <div id="container-env-rows"></div>
+          </div>
         </div>
-        <button id="btn-save-guest" class="primary">Save Container</button>
+        <div class="row">
+          <button id="btn-save-guest" class="primary">Save Container (.nix + SOPS)</button>
+          <button id="btn-save-push-guest">Save &amp; Push</button>
+        </div>
       </div>
     </section>
 
     <section id="tab-vms" class="panel">
       <div class="card">
-        <h3>KVM Virtual Machine (<code>guests.json</code>)</h3>
+        <h3>KVM Virtual Machine (<code>nix/&lt;name&gt;.nix</code>)</h3>
         <div class="form-grid">
           <div><label>VM Name</label><input id="vm-name" class="full" placeholder="iot-gateway" /></div>
           <div>
@@ -115,18 +125,21 @@
             <input id="vm-usb" class="full" placeholder="0bda:8812, 10c4:ea60" style="margin-top:0.4rem;" />
           </div>
         </div>
-        <button id="btn-save-vm" class="primary">Save VM</button>
+        <div class="row">
+          <button id="btn-save-vm" class="primary">Save VM (.nix)</button>
+          <button id="btn-save-push-vm">Save &amp; Push</button>
+        </div>
       </div>
     </section>
 
     <section id="tab-secrets" class="panel">
       <div class="card">
         <div class="row between" style="margin-bottom: 0.5rem;">
-          <h3>Host Age Identity (<code>sops-nix</code> &amp; <code>nixpit-secrets</code>)</h3>
+          <h3>Host Age Identity (<code>sops-nix</code>)</h3>
           <div class="row">
             <button id="btn-copy-age" class="sm">Copy Age Key</button>
             <button id="btn-copy-sops-yaml" class="sm">Copy .sops.yaml</button>
-            <button id="btn-sync-secrets" class="sm warn">Sync Runtime</button>
+            <button id="btn-init-sops-yaml" class="sm warn">Init .sops.yaml in Repo</button>
           </div>
         </div>
         <code id="age-pubkey">Loading...</code>
@@ -137,16 +150,17 @@
         <div class="row between" style="margin-bottom: 0.75rem;">
           <div class="row">
             <select id="secret-select"></select>
-            <input id="new-secret-name" placeholder="new-secret-name" />
+            <input id="new-secret-name" placeholder="app, compose, dockerfile..." />
             <button id="btn-new-secret">+ New</button>
           </div>
           <div class="row">
             <button id="btn-save-secret" class="primary">Encrypt &amp; Save</button>
+            <button id="btn-save-push-secret">Encrypt &amp; Push</button>
             <button id="btn-del-secret" class="danger">Delete</button>
           </div>
         </div>
-        <p class="muted" style="margin-top: 0;">
-          Encrypted at rest with SOPS + Age in <code>/var/lib/nixpit/secrets/&lt;name&gt;.sops.env</code> and mounted in tmpfs at <code>/run/nixpit/secrets/</code>. Repo-committed <code>secrets/*.sops.env</code> decrypt via <code>sops-nix</code> into <code>/run/secrets/nixpit/</code>.
+        <p id="secret-path-note" class="muted" style="margin-top: 0;">
+          Select a repository secret or create one. Stored encrypted in <code>secrets/&lt;name&gt;.sops.env</code> inside Git and decrypted by <code>sops-nix</code> into RAM at <code>/run/secrets/nixpit/&lt;repo&gt;/&lt;name&gt;</code>.
         </p>
         <div id="env-rows"></div>
         <button id="btn-add-env-row" class="sm" style="margin-top: 0.6rem;">+ Add Variable</button>
@@ -156,14 +170,15 @@
     <section id="tab-code" class="panel">
       <div class="card">
         <div class="row between" style="margin-bottom: 0.65rem;">
-          <select id="file-select">
-            <option value="guests.json">guests.json</option>
-            <option value="compose.yaml">compose.yaml</option>
-            <option value="docker-compose.yml">docker-compose.yml</option>
-            <option value="Dockerfile">Dockerfile</option>
-            <option value=".sops.yaml">.sops.yaml</option>
-          </select>
-          <button id="btn-save-raw" class="primary">Save File</button>
+          <div class="row">
+            <select id="file-select"></select>
+            <input id="new-nix-file" placeholder="nix/my-app.nix" size="16" />
+            <button id="btn-new-nix-file" class="sm">+ New .nix</button>
+          </div>
+          <div class="row">
+            <button id="btn-save-raw" class="primary">Save File</button>
+            <button id="btn-save-push-raw">Save &amp; Push</button>
+          </div>
         </div>
         <textarea id="raw-editor" spellcheck="false"></textarea>
       </div>
@@ -178,7 +193,7 @@
           <div class="span-2">
             <label>Git Repository URL (SSH or HTTPS)</label>
             <div class="row">
-              <input id="new-repo-url" placeholder="git@github.com:user/guests-repo.git" style="flex: 1;" />
+              <input id="new-repo-url" placeholder="git@github.com:user/nixpit-workloads.git" style="flex: 1;" />
               <button id="btn-add-repo" class="primary">+ Add Profile &amp; Key</button>
             </div>
           </div>

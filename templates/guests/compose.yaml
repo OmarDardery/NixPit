@@ -1,0 +1,10 @@
+# Optional Compose stack (automatically started via homelab-compose-<repo>.service).
+# If you encrypt env vars under the `compose` secret in Cockpit, sops-nix decrypts them to:
+#   /run/secrets/nixpit/<repo>/compose (also passed as systemd EnvironmentFile).
+services:
+  custom-app:
+    build: .
+    container_name: custom-app
+    ports:
+      - "8090:8080"
+    restart: unless-stopped

@@ -2,6 +2,6 @@ result
 result-*
 .env
 *.env
+!secrets/*.sops.env
 !.env.example
-secrets/
 *.qcow2

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# nixpit-repo — Per-profile SSH Git keygen and workload repository sync manager.
+# nixpit-repo — Per-profile SSH Git keygen and pure Nix/Compose/Dockerfile/SOPS repo manager.
 #
 # What: Manages Git repo profiles in repos.json, generates an isolated ed25519
-#       SSH deploy key per profile, and clones/syncs/diffs/pushes workload configs.
-# How:  Uses atomic temp-file writes for repos.json, enforces 0700/0600 key perms,
-#       and passes a per-profile GIT_SSH_COMMAND with IdentitiesOnly=yes.
-# Why:  Isolates deploy credentials per repo so compromising one repo key cannot
-#       access others, and refuses dirty overwrites or symlink/secret commits.
+#       SSH deploy key per profile, clones/syncs/inspects/diffs/pushes workload configs.
+# How:  Uses atomic temp-file writes for repos.json, checks Nix syntax with
+#       `nix-instantiate --parse`, passes per-profile GIT_SSH_COMMAND (`IdentitiesOnly=yes`),
+#       and blocks plaintext .env files or tampered SOPS files from being pushed.
+# Why:  Isolates deploy credentials per repo and keeps external workload repos
+#       100% standard Nix / Compose / Dockerfile / SOPS ciphertext.
 
 set -euo pipefail
 
@@ -51,7 +52,6 @@ ensure_dirs() {
 }
 
 # Write `content` to a temporary file in the target directory, chmod, and atomically rename.
-# Why: Prevents truncated/corrupt repos.json if interrupted mid-write.
 atomic_write() {
   local target="$1"
   local mode="$2"
@@ -68,6 +68,29 @@ ssh_cmd_for() {
   local key_path="$1"
   printf 'ssh -i %s -o IdentitiesOnly=yes -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new' \
     "$key_path" "$KNOWN_HOSTS"
+}
+
+# Run nix-instantiate cleanly even inside sandboxed builds without nix-daemon.
+run_nix_instantiate() {
+  local nix_state="${TMPDIR:-/tmp}/nixpit-nix-state"
+  install -d -m 0700 "$nix_state"
+  NIX_REMOTE="" NIX_STATE_DIR="$nix_state" nix-instantiate "$@"
+}
+
+# Verify Nix syntax on every discovered `.nix` workload module in `dir`.
+validate_repo_nix() {
+  local dir="$1"
+  local f
+  for f in "${dir}/workloads.nix" "${dir}/default.nix"; do
+    if [[ -f "$f" ]]; then
+      run_nix_instantiate --parse "$f" >/dev/null || die "invalid Nix syntax in $f"
+    fi
+  done
+  if [[ -d "${dir}/nix" ]]; then
+    while IFS= read -r -d '' f; do
+      run_nix_instantiate --parse "$f" >/dev/null || die "invalid Nix syntax in $f"
+    done < <(find "${dir}/nix" -maxdepth 1 -type f -name '*.nix' -print0 | sort -z)
+  fi
 }
 
 # Look up a field (url, branch, keyPath) for profile `name` inside repos.json.
@@ -184,7 +207,7 @@ cmd_pubkey() {
 }
 
 # Clone (if missing) or fast-forward pull a single profile's pinned branch using its SSH key.
-# Fails closed if the local checkout has uncommitted changes or invalid guests.json.
+# Fails closed if the local checkout has uncommitted changes or invalid `.nix` syntax.
 sync_one() {
   local name="$1"
   validate_name "$name"
@@ -213,9 +236,7 @@ sync_one() {
     GIT_SSH_COMMAND="$ssh_cmd" git -C "$dir" pull --ff-only origin "$branch"
   fi
 
-  if [[ -f "${dir}/guests.json" ]]; then
-    jq empty "${dir}/guests.json" || die "invalid JSON in ${dir}/guests.json"
-  fi
+  validate_repo_nix "$dir"
   echo "Synced ${name} (${branch}) at $(git -C "$dir" rev-parse --short HEAD)"
 }
 
@@ -235,6 +256,83 @@ cmd_sync() {
   fi
 }
 
+# `inspect <name>` — Parse all `.nix` workload files, Compose/Dockerfile files, `.sops.yaml`,
+# and `secrets/*.sops.env` in `name`, emitting a single JSON summary for Cockpit UI.
+cmd_inspect() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: nixpit-repo inspect <name>"
+  validate_name "$name"
+  local dir="${REPOS_DIR}/${name}"
+  [[ -d "$dir" ]] || die "profile '$name' is not cloned"
+
+  local compose_file="" has_df=false has_sops=false
+  if [[ -f "${dir}/compose.yaml" ]]; then
+    compose_file="compose.yaml"
+  elif [[ -f "${dir}/docker-compose.yml" ]]; then
+    compose_file="docker-compose.yml"
+  fi
+  [[ -f "${dir}/Dockerfile" ]] && has_df=true
+  [[ -f "${dir}/.sops.yaml" ]] && has_sops=true
+
+  local secrets_json="[]"
+  if [[ -d "${dir}/secrets" ]]; then
+    secrets_json="$(find "${dir}/secrets" -maxdepth 1 -type f -name '*.sops.env' -printf '%f\n' | sed 's/\.sops\.env$//' | sort | jq -R . | jq -s .)"
+  fi
+
+  local -a rel_nix=()
+  local f
+  for f in workloads.nix default.nix; do
+    [[ -f "${dir}/${f}" ]] && rel_nix+=("$f")
+  done
+  if [[ -d "${dir}/nix" ]]; then
+    while IFS= read -r -d '' f; do
+      rel_nix+=("nix/$(basename "$f")")
+    done < <(find "${dir}/nix" -maxdepth 1 -type f -name '*.nix' -print0 | sort -z)
+  fi
+
+  local nix_files_json containers_json="{}" vms_json="{}" custom_json="[]"
+  nix_files_json="$(printf '%s\n' "${rel_nix[@]:-}" | sed '/^$/d' | jq -R . | jq -s .)"
+
+  for rel in "${rel_nix[@]:-}"; do
+    [[ -n "$rel" ]] || continue
+    local abs="${dir}/${rel}" eval_out=""
+    local expr
+    expr="let
+      m = import ${abs};
+      stubLib = { mkIf = c: v: if c then v else {}; mkDefault = x: x; mkForce = x: x; };
+      res = if builtins.isFunction m then m { config = {}; pkgs = {}; lib = stubLib; nixvirt = {}; nixpitStateDir = \"/var/lib/nixpit\"; } else m;
+      w = (res.services or {}).nixpit.workloads or {};
+    in {
+      containers = w.containers or {};
+      vms = w.vms or {};
+    }"
+    if eval_out="$(run_nix_instantiate --eval --strict --json --expr "$expr" 2>/dev/null)"; then
+      local c_chunk v_chunk
+      c_chunk="$(jq --arg f "$rel" '.containers | with_entries(.value += { _file: $f })' <<< "$eval_out")"
+      v_chunk="$(jq --arg f "$rel" '.vms | with_entries(.value += { _file: $f })' <<< "$eval_out")"
+      containers_json="$(jq -s '.[0] * .[1]' <<< "${containers_json}"$'\n'"${c_chunk}")"
+      vms_json="$(jq -s '.[0] * .[1]' <<< "${vms_json}"$'\n'"${v_chunk}")"
+      if [[ "$(jq '(.containers | length) + (.vms | length)' <<< "$eval_out")" -eq 0 ]]; then
+        custom_json="$(jq --arg f "$rel" '. + [$f]' <<< "$custom_json")"
+      fi
+    else
+      custom_json="$(jq --arg f "$rel" '. + [$f]' <<< "$custom_json")"
+    fi
+  done
+
+  jq -nc \
+    --arg name "$name" \
+    --argjson nixFiles "$nix_files_json" \
+    --argjson customNixModules "$custom_json" \
+    --arg composeFile "$compose_file" \
+    --argjson hasDockerfile "$has_df" \
+    --argjson hasSopsYaml "$has_sops" \
+    --argjson secrets "$secrets_json" \
+    --argjson containers "$containers_json" \
+    --argjson vms "$vms_json" \
+    '{ name: $name, nixFiles: $nixFiles, customNixModules: $customNixModules, composeFile: $composeFile, hasDockerfile: $hasDockerfile, hasSopsYaml: $hasSopsYaml, secrets: $secrets, containers: $containers, vms: $vms }'
+}
+
 # `diff <name>` — Display working-tree status plus unstaged and staged diffs for `name`.
 cmd_diff() {
   local name="${1:-}"
@@ -247,8 +345,8 @@ cmd_diff() {
   git -C "$dir" diff --cached
 }
 
-# `push <name> [message]` — Stage allowlisted workload files (never plaintext .env or symlinks),
-# commit if changed, and push to the pinned branch using the profile's SSH key.
+# `push <name> [message]` — Stage allowlisted Nix/Compose/Dockerfile/SOPS files (never
+# plaintext .env or symlinks), verify SOPS ciphertext, commit, and push with profile SSH key.
 cmd_push() {
   local name="${1:-}" msg="${2:-Update NixPit configs}"
   [[ -n "$name" ]] || die "usage: nixpit-repo push <name> [message]"
@@ -263,21 +361,58 @@ cmd_push() {
   [[ -d "${dir}/.git" ]] || die "profile '$name' is not cloned"
   ssh_cmd="$(ssh_cmd_for "$key_path")"
 
+  validate_repo_nix "$dir"
+
   (
     cd "$dir"
+    # Fail closed if any plaintext .env file (not *.sops.env) exists in tracked or untracked paths.
+    while IFS= read -r status_line; do
+      [[ -n "$status_line" ]] || continue
+      local path="${status_line:3}"
+      path="${path##* -> }"
+      local base
+      base="$(basename "$path")"
+      if [[ "$base" == ".env" || ( "$base" == *.env && "$base" != *.sops.env ) ]]; then
+        die "refusing plaintext env file '$path' (use nixpit-secrets repo-set)"
+      fi
+    done < <(git status --porcelain --untracked-files=all)
+
     if [[ -n "$(git status --porcelain)" ]]; then
       if ! git diff --cached --quiet; then
         die "refusing to commit pre-staged index; unstage first"
       fi
-      local candidates=(guests.json compose.yaml docker-compose.yml Dockerfile .sops.yaml)
+
+      local -a candidates=(workloads.nix default.nix compose.yaml docker-compose.yml Dockerfile .sops.yaml .gitignore)
+      local item
+      if [[ -d nix ]]; then
+        while IFS= read -r -d '' item; do
+          candidates+=("$item")
+        done < <(find nix -maxdepth 1 -name '*.nix' -print0)
+      fi
+      while IFS= read -r item; do
+        [[ -n "$item" ]] && candidates+=("$item")
+      done < <(git ls-files 'nix/*.nix')
+
       if [[ -d secrets ]]; then
-        while IFS= read -r -d '' sf; do
-          candidates+=("$sf")
+        while IFS= read -r -d '' item; do
+          candidates+=("$item")
         done < <(find secrets -maxdepth 1 \( -name '*.sops.env' -o -name '*.sops.yaml' -o -name '*.sops.yml' \) -print0)
       fi
+      while IFS= read -r item; do
+        [[ "$item" =~ ^secrets/.*\.sops\.(env|ya?ml)$ ]] && candidates+=("$item")
+      done < <(git ls-files 'secrets/*')
+
+      declare -A seen=()
       for f in "${candidates[@]}"; do
+        [[ -z "${seen[$f]:-}" ]] || continue
+        seen["$f"]=1
         if [[ -L "$f" ]]; then
           die "refusing symlink: $f"
+        fi
+        if [[ "$f" =~ ^secrets/.*\.sops\.env$ && -f "$f" ]]; then
+          if ! grep -q 'ENC\[AES256_GCM,' "$f" || ! grep -q 'sops_version=' "$f"; then
+            die "refusing unencrypted SOPS file '$f'"
+          fi
         fi
         if [[ -f "$f" ]] || git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
           git add -- "$f"
@@ -313,8 +448,9 @@ case "$sub" in
   keygen) cmd_keygen "$@" ;;
   pubkey) cmd_pubkey "$@" ;;
   sync) cmd_sync "$@" ;;
+  inspect) cmd_inspect "$@" ;;
   diff) cmd_diff "$@" ;;
   push) cmd_push "$@" ;;
   remove) cmd_remove "$@" ;;
-  *) die "unknown command '$sub' (expected: list, add, keygen, pubkey, sync, diff, push, remove)" ;;
+  *) die "unknown command '$sub' (expected: list, add, keygen, pubkey, sync, inspect, diff, push, remove)" ;;
 esac

@@ -38,58 +38,71 @@
 
     virtmon = ciSystem.config.boot.kernelPackages.callPackage ./kernel/nixpit-virtmon { };
 
-    # Build a synthetic NixPit state directory containing containers, VMs, Compose, and
-    # a real SOPS-encrypted dotenv secret to test guest-loader.nix offline.
+    # Build a synthetic NixPit state directory containing pure Nix workload modules (`nix/*.nix`),
+    # `compose.yaml`, and SOPS-encrypted dotenv secrets to test guest-loader.nix offline.
     fixtureState = pkgs.runCommand "nixpit-fixture-state" {
       nativeBuildInputs = [ pkgs.age pkgs.sops ];
     } ''
-      mkdir -p "$out/repos/test-repo/secrets" "$out/secrets" "$out/sops/age"
+      mkdir -p "$out/repos/test-repo/nix" "$out/repos/test-repo/secrets" "$out/secrets" "$out/sops/age"
       age-keygen -o "$out/sops/age/keys.txt" 2>/dev/null
       pub=$(age-keygen -y "$out/sops/age/keys.txt")
+
       printf 'WEB_TOKEN=fixture-sops-token\n' > web.env
       SOPS_AGE_KEY_FILE="$out/sops/age/keys.txt" sops --encrypt --age "$pub" \
         --input-type dotenv --output-type dotenv web.env > "$out/repos/test-repo/secrets/web.sops.env"
 
+      printf 'COMPOSE_API_KEY=compose-sops-key\n' > compose.env
+      SOPS_AGE_KEY_FILE="$out/sops/age/keys.txt" sops --encrypt --age "$pub" \
+        --input-type dotenv --output-type dotenv compose.env > "$out/repos/test-repo/secrets/compose.sops.env"
+
       cat > "$out/repos.json" <<'JSON'
       [{ "name": "test-repo", "url": "https://github.com/example/test-repo.git", "branch": "main" }]
 JSON
-      cat > "$out/repos/test-repo/guests.json" <<'JSON'
-      {
-        "containers": {
-          "web": {
-            "image": "docker.io/library/nginx:alpine",
-            "ports": ["8080:80", "5353:5353/udp", "[::]:8443:443/tcp"],
-            "volumes": ["/var/lib/web:/data", "/etc/nixpit-forbidden:/ro:ro"],
-            "network": "app-net",
-            "domain": "app.home.arpa",
-            "secretName": "web"
-          },
-          "local-only": {
-            "image": "docker.io/library/redis:alpine",
-            "ports": ["127.0.0.1:3000:3000", "[::1]:3001:3001"]
-          }
-        },
-        "vms": {
-          "vm-default": {
-            "uuid": "cc7439ed-36af-4696-a6f2-1f0c4474d87e",
-            "vcpus": 2,
-            "memoryGiB": 2,
-            "disk": "debian-13.qcow2",
-            "network": "default",
-            "usbPassthrough": ["0bda:8812"],
-            "active": true
-          },
-          "vm-bridge": {
-            "uuid": "dd7439ed-36af-4696-a6f2-1f0c4474d87f",
-            "vcpus": 4,
-            "memoryGiB": 4,
-            "disk": "/var/lib/libvirt/images/custom.qcow2",
-            "network": "br0",
-            "active": false
-          }
-        }
+      cat > "$out/repos/test-repo/nix/web.nix" <<'NIX'
+      { ... }: {
+        services.nixpit.workloads.containers.web = {
+          image = "docker.io/library/nginx:alpine";
+          ports = [ "8080:80" "5353:5353/udp" "[::]:8443:443/tcp" ];
+          volumes = [ "/var/lib/web:/data" "/etc/nixpit-forbidden:/ro:ro" ];
+          network = "app-net";
+          domain = "app.home.arpa";
+          secretName = "web";
+        };
       }
-JSON
+NIX
+      cat > "$out/repos/test-repo/nix/local-only.nix" <<'NIX'
+      { ... }: {
+        services.nixpit.workloads.containers.local-only = {
+          image = "docker.io/library/redis:alpine";
+          ports = [ "127.0.0.1:3000:3000" "[::1]:3001:3001" ];
+        };
+      }
+NIX
+      cat > "$out/repos/test-repo/nix/vm-default.nix" <<'NIX'
+      { ... }: {
+        services.nixpit.workloads.vms.vm-default = {
+          uuid = "cc7439ed-36af-4696-a6f2-1f0c4474d87e";
+          vcpus = 2;
+          memoryGiB = 2;
+          disk = "debian-13.qcow2";
+          network = "default";
+          usbPassthrough = [ "0bda:8812" ];
+          active = true;
+        };
+      }
+NIX
+      cat > "$out/repos/test-repo/nix/vm-bridge.nix" <<'NIX'
+      { ... }: {
+        services.nixpit.workloads.vms.vm-bridge = {
+          uuid = "dd7439ed-36af-4696-a6f2-1f0c4474d87f";
+          vcpus = 4;
+          memoryGiB = 4;
+          disk = "/var/lib/libvirt/images/custom.qcow2";
+          network = "br0";
+          active = false;
+        };
+      }
+NIX
       cat > "$out/repos/test-repo/compose.yaml" <<'YAML'
       services:
         demo:
@@ -98,29 +111,47 @@ JSON
 YAML
     '';
 
-    # Helper to evaluate NixPit against a custom stateDir (for valid and invalid fixtures).
+    # Synthetic state containing a standalone Dockerfile + SOPS secret (no compose.yaml).
+    dockerfileFixtureState = pkgs.runCommand "nixpit-dockerfile-fixture" {
+      nativeBuildInputs = [ pkgs.age pkgs.sops ];
+    } ''
+      mkdir -p "$out/repos/df-repo/secrets" "$out/sops/age"
+      age-keygen -o "$out/sops/age/keys.txt" 2>/dev/null
+      pub=$(age-keygen -y "$out/sops/age/keys.txt")
+      printf 'DF_SECRET=df-ok\n' > df.env
+      SOPS_AGE_KEY_FILE="$out/sops/age/keys.txt" sops --encrypt --age "$pub" \
+        --input-type dotenv --output-type dotenv df.env > "$out/repos/df-repo/secrets/dockerfile.sops.env"
+      printf '[{ "name": "df-repo", "url": "https://github.com/example/df-repo.git", "branch": "main" }]\n' > "$out/repos.json"
+      printf 'FROM alpine:3.20\nCMD ["sleep", "10"]\n' > "$out/repos/df-repo/Dockerfile"
+    '';
+
+    # Evaluate NixPit against a custom stateDir passed cleanly to mk-guest-loader (no infinite recursion).
     mkFixtureSystem = stateDir: (nixpkgs.lib.nixosSystem {
       inherit system;
       modules = [
-        self.nixosModules.default
+        nixvirt.nixosModules.default
+        sops-nix.nixosModules.sops
+        ./modules/host.nix
+        (import ./modules/mk-guest-loader.nix "${stateDir}")
         {
+          _module.args.nixvirt = nixvirt;
           system.stateVersion = "25.11";
           boot.loader.grub.enable = false;
           fileSystems."/" = { device = "/dev/vda"; fsType = "ext4"; };
-          services.nixpit.stateDir = stateDir;
         }
       ];
     }).config;
 
     fixtureCfg = mkFixtureSystem "${fixtureState}";
+    dockerfileCfg = mkFixtureSystem "${dockerfileFixtureState}";
 
-    # Helper to construct invalid guests.json fixtures for fail-closed negative tests.
-    mkBadState = name: jsonText: pkgs.runCommand "nixpit-bad-${name}" {} ''
+    # Helper to construct invalid Nix workload fixtures for fail-closed negative tests.
+    mkBadState = name: nixText: pkgs.runCommand "nixpit-bad-${name}" {} ''
       mkdir -p "$out/repos/bad"
       printf '[{"name":"bad","url":"https://github.com/example/bad.git"}]\n' > "$out/repos.json"
-      cat > "$out/repos/bad/guests.json" <<'JSON'
-      ${jsonText}
-JSON
+      cat > "$out/repos/bad/workloads.nix" <<'NIX'
+      ${nixText}
+NIX
     '';
 
     # Ephemeral Age keypair + encrypted secret used inside the QEMU VM integration test.
@@ -146,7 +177,7 @@ JSON
       inherit virtmon;
 
       # Disposable NixOS QEMU VM test verifying nixpit_virtmon.ko, Libvirt/NixVirt,
-      # Cockpit plugin packaging, sops-nix, nixpit-secrets.service, and nixpit-repo.
+      # Cockpit plugin packaging, sops-nix, nixpit-secrets repo roundtrip, and nixpit-repo.
       vm-test = pkgs.testers.runNixOSTest {
         name = "nixpit-virtualization-vm-test";
         nodes.machine = { lib, ... }: {
@@ -201,35 +232,42 @@ JSON
             machine.succeed(f"test -r /etc/cockpit/share/cockpit/{p}/manifest.json")
             machine.succeed(f"test -r /etc/cockpit/share/cockpit/{p}/theme.css")
 
-          # 3. sops-nix & nixpit-secrets
+          # 3. sops-nix & repo-scoped SOPS encrypt -> push -> pull -> decrypt/edit -> push
           assert machine.succeed("stat -c '%a' /run/secrets/nixpit/vm-secret").strip() == "400"
           assert machine.succeed("cat /run/secrets/nixpit/vm-secret").strip() == "VM_SOPS_OK=yes"
 
-          machine.succeed("printf 'DB_PASS=correct-horse-battery\n' | nixpit-secrets set db")
-          assert "correct-horse-battery" not in machine.succeed("cat /var/lib/nixpit/secrets/db.sops.env")
-          assert machine.succeed("stat -c '%a' /run/nixpit/secrets/db.env").strip() == "400"
-          assert machine.succeed("cat /run/nixpit/secrets/db.env").strip() == "DB_PASS=correct-horse-battery"
-          machine.succeed("rm -f /run/nixpit/secrets/db.env && systemctl restart nixpit-secrets.service")
-          assert machine.succeed("cat /run/nixpit/secrets/db.env").strip() == "DB_PASS=correct-horse-battery"
-
-          # 4. nixpit-repo SSH keygen, profile management, and config sync
           machine.succeed("""
             set -eu
             git init --bare /tmp/remote.git
             git clone /tmp/remote.git /tmp/seed
             git -C /tmp/seed -c user.name=Test -c user.email=t@t checkout -b main
-            printf '{"containers":{},"vms":{}}\n' > /tmp/seed/guests.json
-            git -C /tmp/seed add guests.json
+            printf '{ ... }: { services.nixpit.workloads.containers.demo = { image = "docker.io/library/nginx:alpine"; ports = [ "8080:80" ]; }; }\n' > /tmp/seed/workloads.nix
+            git -C /tmp/seed add workloads.nix
             git -C /tmp/seed -c user.name=Test -c user.email=t@t commit -m init
             git -C /tmp/seed push origin main
+
             nixpit-repo add lab /tmp/remote.git main
             test "$(stat -c '%a' /var/lib/nixpit/keys/lab.ed25519)" = "600"
-            old_pub=$(nixpit-repo pubkey lab)
             nixpit-repo sync lab
-            test -f /var/lib/nixpit/repos/lab/guests.json
-            new_pub=$(nixpit-repo keygen lab --force)
-            test "$old_pub" != "$new_pub"
+            inspected=$(nixpit-repo inspect lab)
+            echo "$inspected" | jq -e '.containers.demo.image == "docker.io/library/nginx:alpine"'
+
+            printf 'DB_PASS=first-pass\n' | nixpit-secrets repo-set lab demo
+            test -f /var/lib/nixpit/repos/lab/.sops.yaml
+            ! grep -q 'first-pass' /var/lib/nixpit/repos/lab/secrets/demo.sops.env
+            test "$(nixpit-secrets repo-get lab demo)" = "DB_PASS=first-pass"
+            nixpit-repo push lab "add demo secret"
+
+            nixpit-repo add lab2 /tmp/remote.git main
+            nixpit-repo sync lab2
+            test "$(nixpit-secrets repo-get lab2 demo)" = "DB_PASS=first-pass"
+            printf 'DB_PASS=edited-pass\n' | nixpit-secrets repo-set lab2 demo
+            nixpit-repo push lab2 "edit demo secret"
+
+            nixpit-repo sync lab
+            test "$(nixpit-secrets repo-get lab demo)" = "DB_PASS=edited-pass"
             nixpit-repo remove lab --purge
+            nixpit-repo remove lab2 --purge
           """)
         '';
       };
@@ -297,46 +335,82 @@ JSON
         touch $out
       '';
 
-      # Run sandboxed end-to-end tests on nixpit-repo and nixpit-secrets CLIs.
+      # Run sandboxed end-to-end tests on nixpit-repo and nixpit-secrets CLIs:
+      # pull -> inspect -> encrypt repo SOPS -> push -> pull in 2nd checkout -> edit -> push -> pull.
       cli-tests = pkgs.runCommand "nixpit-cli-tests" {
-        nativeBuildInputs = [ pkgs.git pkgs.openssh pkgs.jq pkgs.sops pkgs.age ];
+        nativeBuildInputs = [ pkgs.git pkgs.openssh pkgs.jq pkgs.sops pkgs.age pkgs.nix ];
       } ''
         set -eu
         export NIXPIT_STATE_DIR="$TMPDIR/state"
         export NIXPIT_RUNTIME_DIR="$TMPDIR/run"
+        export GIT_AUTHOR_NAME="NixPit CI"
+        export GIT_AUTHOR_EMAIL="ci@nixpit.local"
+        export GIT_COMMITTER_NAME="NixPit CI"
+        export GIT_COMMITTER_EMAIL="ci@nixpit.local"
 
         git init --bare "$TMPDIR/remote.git"
         git clone "$TMPDIR/remote.git" "$TMPDIR/seed"
-        git -C "$TMPDIR/seed" -c user.name=Test -c user.email=t@t checkout -b main
-        printf '{"containers":{},"vms":{}}\n' > "$TMPDIR/seed/guests.json"
-        git -C "$TMPDIR/seed" add guests.json
-        git -C "$TMPDIR/seed" -c user.name=Test -c user.email=t@t commit -m init
+        git -C "$TMPDIR/seed" checkout -b main
+        mkdir -p "$TMPDIR/seed/nix"
+        cat > "$TMPDIR/seed/nix/web.nix" <<'NIX'
+        { ... }: {
+          services.nixpit.workloads.containers.web = {
+            image = "docker.io/library/nginx:alpine";
+            ports = [ "8080:80" ];
+          };
+        }
+NIX
+        printf 'services:\n  web:\n    image: alpine:3.20\n' > "$TMPDIR/seed/compose.yaml"
+        printf 'FROM alpine:3.20\n' > "$TMPDIR/seed/Dockerfile"
+        git -C "$TMPDIR/seed" add nix/web.nix compose.yaml Dockerfile
+        git -C "$TMPDIR/seed" commit -m init
         git -C "$TMPDIR/seed" push origin main
 
         ${cli.nixpit-repo}/bin/nixpit-repo add p1 "file://$TMPDIR/remote.git" main >/dev/null
         test "$(stat -c '%a' "$NIXPIT_STATE_DIR/keys/p1.ed25519")" = "600"
         ${cli.nixpit-repo}/bin/nixpit-repo sync p1
-        test -f "$NIXPIT_STATE_DIR/repos/p1/guests.json"
-        ${cli.nixpit-repo}/bin/nixpit-repo keygen p1 --force >/dev/null
-        ${cli.nixpit-repo}/bin/nixpit-repo remove p1 --purge >/dev/null
-        test ! -d "$NIXPIT_STATE_DIR/repos/p1"
+        inspected=$(${cli.nixpit-repo}/bin/nixpit-repo inspect p1)
+        echo "$inspected" | jq -e '.containers.web.image == "docker.io/library/nginx:alpine"'
+        echo "$inspected" | jq -e '.composeFile == "compose.yaml" and .hasDockerfile == true'
 
         pub=$(${cli.nixpit-secrets}/bin/nixpit-secrets pubkey)
         [[ "$pub" == age1* ]]
         ${cli.nixpit-secrets}/bin/nixpit-secrets sops-config | grep -q "$pub"
-        printf 'API_TOKEN=super-secret-value\n' | ${cli.nixpit-secrets}/bin/nixpit-secrets set app1 >/dev/null
-        ! grep -q 'super-secret-value' "$NIXPIT_STATE_DIR/secrets/app1.sops.env"
-        test "$(${cli.nixpit-secrets}/bin/nixpit-secrets get app1)" = "API_TOKEN=super-secret-value"
-        test "$(cat "$NIXPIT_RUNTIME_DIR/app1.env")" = "API_TOKEN=super-secret-value"
-        rm -f "$NIXPIT_RUNTIME_DIR/app1.env"
-        ${cli.nixpit-secrets}/bin/nixpit-secrets sync
-        test "$(cat "$NIXPIT_RUNTIME_DIR/app1.env")" = "API_TOKEN=super-secret-value"
-        ${cli.nixpit-secrets}/bin/nixpit-secrets delete app1 >/dev/null
-        test ! -e "$NIXPIT_RUNTIME_DIR/app1.env"
+
+        printf 'API_TOKEN=super-secret-v1\nDB_URL=postgres://db\n' | ${cli.nixpit-secrets}/bin/nixpit-secrets repo-set p1 web >/dev/null
+        test -f "$NIXPIT_STATE_DIR/repos/p1/.sops.yaml"
+        ! grep -q 'super-secret-v1' "$NIXPIT_STATE_DIR/repos/p1/secrets/web.sops.env"
+        ${cli.nixpit-secrets}/bin/nixpit-secrets repo-list p1 | jq -e '.secrets == ["web"] and .hasSopsYaml == true'
+        ${cli.nixpit-secrets}/bin/nixpit-secrets repo-get p1 web | grep -q '^API_TOKEN=super-secret-v1$'
+
+        ${cli.nixpit-repo}/bin/nixpit-repo push p1 "encrypt web env"
+
+        # Clone into p2, pull, decrypt & edit env vars, push back, pull in p1
+        ${cli.nixpit-repo}/bin/nixpit-repo add p2 "file://$TMPDIR/remote.git" main >/dev/null
+        ${cli.nixpit-repo}/bin/nixpit-repo sync p2
+        ${cli.nixpit-secrets}/bin/nixpit-secrets repo-get p2 web | grep -q '^API_TOKEN=super-secret-v1$'
+        printf 'API_TOKEN=rotated-secret-v2\nDB_URL=postgres://db2\n' | ${cli.nixpit-secrets}/bin/nixpit-secrets repo-set p2 web >/dev/null
+        ${cli.nixpit-repo}/bin/nixpit-repo push p2 "rotate web env"
+
+        ${cli.nixpit-repo}/bin/nixpit-repo sync p1
+        ${cli.nixpit-secrets}/bin/nixpit-secrets repo-get p1 web | grep -q '^API_TOKEN=rotated-secret-v2$'
+
+        # Plaintext .env files must be rejected by push (fail-closed)
+        printf 'LEAK=plaintext\n' > "$NIXPIT_STATE_DIR/repos/p1/secret.env"
+        if ${cli.nixpit-repo}/bin/nixpit-repo push p1 "should fail" 2>/dev/null; then
+          echo "Expected push with plaintext .env to fail" >&2
+          exit 1
+        fi
+        rm -f "$NIXPIT_STATE_DIR/repos/p1/secret.env"
+
+        ${cli.nixpit-repo}/bin/nixpit-repo keygen p1 --force >/dev/null
+        ${cli.nixpit-repo}/bin/nixpit-repo remove p1 --purge >/dev/null
+        ${cli.nixpit-repo}/bin/nixpit-repo remove p2 --purge >/dev/null
+        test ! -d "$NIXPIT_STATE_DIR/repos/p1"
         touch $out
       '';
 
-      # Verify guest-loader.nix outputs valid firewall, Caddy, sops-nix, and xmllint-clean VM XMLs.
+      # Verify guest-loader.nix compiles Nix modules, Compose, Dockerfile, Caddy, sops-nix, and VM XMLs.
       guest-loader-eval = let
         domains = fixtureCfg.virtualisation.libvirt.connections."qemu:///system".domains;
         networks = fixtureCfg.virtualisation.libvirt.connections."qemu:///system".networks;
@@ -348,10 +422,15 @@ JSON
         hasVhost = fixtureCfg.services.caddy.virtualHosts ? "http://app.home.arpa";
         hasNetUnit = fixtureCfg.systemd.services ? "podman-network-app-net";
         hasComposeUnit = fixtureCfg.systemd.services ? "homelab-compose-test-repo";
-        hasSopsSecret = fixtureCfg.sops.secrets ? "nixpit/web";
+        composeEnvFiles = fixtureCfg.systemd.services."homelab-compose-test-repo".serviceConfig.EnvironmentFile or [];
+        composeSopsPath = fixtureCfg.sops.secrets."nixpit/test-repo/compose".path;
+        hasSopsSecret = fixtureCfg.sops.secrets ? "nixpit/test-repo/web";
         webEnvFiles = fixtureCfg.virtualisation.oci-containers.containers.web.environmentFiles;
-        sopsPath = fixtureCfg.sops.secrets."nixpit/web".path;
+        sopsPath = fixtureCfg.sops.secrets."nixpit/test-repo/web".path;
         sopsManifest = fixtureCfg.system.build.sops-nix-manifest;
+        hasDockerfileUnit = dockerfileCfg.systemd.services ? "homelab-dockerfile-df-repo";
+        dfExec = dockerfileCfg.systemd.services."homelab-dockerfile-df-repo".serviceConfig.ExecStart;
+        dfSecretPath = dockerfileCfg.sops.secrets."nixpit/df-repo/dockerfile".path;
         dom0Xml = (builtins.elemAt domains 1).definition;
         dom1Xml = (builtins.elemAt domains 0).definition;
       in
@@ -362,7 +441,9 @@ JSON
         assert !(pkgs.lib.elem 3000 tcpPorts) && !(pkgs.lib.elem 3001 tcpPorts);
         assert udpPorts == [ 5353 ];
         assert caddyOn && hasVhost && hasNetUnit && hasComposeUnit;
-        assert hasSopsSecret && pkgs.lib.hasPrefix "/run/secrets/" sopsPath && pkgs.lib.elem sopsPath webEnvFiles;
+        assert pkgs.lib.elem composeSopsPath composeEnvFiles;
+        assert hasSopsSecret && pkgs.lib.hasPrefix "/run/secrets/nixpit/test-repo/" sopsPath && pkgs.lib.elem sopsPath webEnvFiles;
+        assert hasDockerfileUnit && pkgs.lib.hasInfix "--env-file ${dfSecretPath}" dfExec;
         assert pkgs.lib.elem "d /var/lib/web 0755 root root -" tmpRules;
         assert !(pkgs.lib.any (r: pkgs.lib.hasInfix "/etc/nixpit-forbidden" r) tmpRules);
         pkgs.runCommand "nixpit-guest-loader-eval" {
@@ -396,25 +477,35 @@ JSON
           in !res.success;
       in
         assert evalRejects (mkBadState "dup-domain" ''
-          { "containers": {
-            "a": { "image": "alpine:3.20", "ports": ["8081:80"], "domain": "dup.home.arpa" },
-            "b": { "image": "alpine:3.20", "ports": ["8082:80"], "domain": "dup.home.arpa" }
-          } }
+          { ... }: {
+            services.nixpit.workloads.containers = {
+              a = { image = "alpine:3.20"; ports = [ "8081:80" ]; domain = "dup.home.arpa"; };
+              b = { image = "alpine:3.20"; ports = [ "8082:80" ]; domain = "dup.home.arpa"; };
+            };
+          }
         '');
         assert evalRejects (mkBadState "dup-port" ''
-          { "containers": {
-            "a": { "image": "alpine:3.20", "ports": ["8080:80"] },
-            "b": { "image": "alpine:3.20", "ports": ["8080:8080"] }
-          } }
+          { ... }: {
+            services.nixpit.workloads.containers = {
+              a = { image = "alpine:3.20"; ports = [ "8080:80" ]; };
+              b = { image = "alpine:3.20"; ports = [ "8080:8080" ]; };
+            };
+          }
         '');
         assert evalRejects (mkBadState "uuid" ''
-          { "vms": { "vm1": { "uuid": "not-a-uuid", "disk": "vm1.qcow2" } } }
+          { ... }: {
+            services.nixpit.workloads.vms.vm1 = { uuid = "not-a-uuid"; disk = "vm1.qcow2"; };
+          }
         '');
         assert evalRejects (mkBadState "net" ''
-          { "containers": { "a": { "image": "alpine:3.20", "network": "bad;net" } } }
+          { ... }: {
+            services.nixpit.workloads.containers.a = { image = "alpine:3.20"; network = "bad;net"; };
+          }
         '');
         assert evalRejects (mkBadState "secret" ''
-          { "containers": { "a": { "image": "alpine:3.20", "secretName": "../escape" } } }
+          { ... }: {
+            services.nixpit.workloads.containers.a = { image = "alpine:3.20"; secretName = "../escape"; };
+          }
         '');
         pkgs.runCommand "nixpit-guest-loader-failures" {} ''
           touch $out

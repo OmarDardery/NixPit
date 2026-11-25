@@ -11,13 +11,13 @@
 
   nixpit-repo = pkgs.writeShellApplication {
     name = "nixpit-repo";
-    runtimeInputs = with pkgs; [ git openssh jq coreutils findutils ];
+    runtimeInputs = with pkgs; [ git openssh jq coreutils findutils nix gnugrep ];
     text = builtins.readFile ./nixpit-repo.sh;
   };
 
   nixpit-secrets = pkgs.writeShellApplication {
     name = "nixpit-secrets";
-    runtimeInputs = with pkgs; [ sops age jq coreutils findutils gnused ];
+    runtimeInputs = with pkgs; [ sops age jq coreutils findutils gnused gnugrep ];
     text = builtins.readFile ./nixpit-secrets.sh;
   };
 }
