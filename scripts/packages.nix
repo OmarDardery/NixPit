@@ -5,7 +5,7 @@
 {
   nixpit-install = pkgs.writeShellApplication {
     name = "nixpit-install";
-    runtimeInputs = with pkgs; [ nix nixos-rebuild iproute2 jq coreutils gawk ];
+    runtimeInputs = with pkgs; [ nix nixos-rebuild iproute2 iputils jq coreutils ];
     text = builtins.readFile ./install.sh;
   };
 

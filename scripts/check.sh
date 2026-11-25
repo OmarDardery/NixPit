@@ -7,6 +7,7 @@ bash -n scripts/install.sh
 bash -n scripts/check.sh
 bash -n scripts/nixpit-repo.sh
 bash -n scripts/nixpit-secrets.sh
+bash scripts/test-install.sh >/dev/null
 python3 - <<'PY'
 import json
 from pathlib import Path

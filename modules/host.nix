@@ -13,6 +13,10 @@
 
 let
   cfg = config.services.nixpit;
+  static = cfg.network.static;
+  # Dotted-quad IPv4 with each octet 0-255.
+  octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
+  ipv4 = "${octet}(\\.${octet}){3}";
   cli = import ../scripts/packages.nix { inherit pkgs; };
 
   # Package a Cockpit web plugin directory into /share/cockpit/<dest>/ along with
@@ -50,10 +54,29 @@ in {
     default = true;
   };
 
-  # Optionally import static network config created during host bootstrap if present.
-  imports = lib.optional (builtins.pathExists /var/lib/nixpit/network.nix) /var/lib/nixpit/network.nix;
+  # Optional static IPv4. null (default) keeps the host's existing network config (DHCP).
+  options.services.nixpit.network.static = lib.mkOption {
+    default = null;
+    description = "Static IPv4 for the management interface; null keeps existing/DHCP networking.";
+    type = lib.types.nullOr (lib.types.submodule {
+      options = {
+        interface = lib.mkOption { type = lib.types.strMatching "[a-zA-Z0-9_.-]{1,15}"; };
+        address = lib.mkOption { type = lib.types.strMatching ipv4; };
+        prefixLength = lib.mkOption { type = lib.types.ints.between 1 32; };
+        gateway = lib.mkOption { type = lib.types.strMatching ipv4; };
+        nameservers = lib.mkOption { type = lib.types.listOf (lib.types.strMatching ipv4); default = [ ]; };
+      };
+    });
+  };
 
   config = {
+    networking.useDHCP = lib.mkIf (static != null) false;
+    networking.interfaces = lib.mkIf (static != null) {
+      ${static.interface}.ipv4.addresses = [ { inherit (static) address prefixLength; } ];
+    };
+    networking.defaultGateway = lib.mkIf (static != null) { address = static.gateway; inherit (static) interface; };
+    networking.nameservers = lib.mkIf (static != null) static.nameservers;
+
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
     # Build and auto-load KVM, vhost_net, tun, and our nixpit_virtmon.ko module at boot.

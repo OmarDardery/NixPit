@@ -287,6 +287,27 @@ NIX
     nixosConfigurations.ci = ciSystem;
 
     checks.${system} = {
+      # Static IPv4 option: valid config maps to NixOS networking; invalid values fail evaluation.
+      network-static = let
+        withNet = static: (ciSystem.extendModules {
+          modules = [ { services.nixpit.network.static = static; } ];
+        }).config;
+        good = withNet { interface = "eth0"; address = "192.168.1.50"; prefixLength = 24; gateway = "192.168.1.1"; nameservers = [ "1.1.1.1" ]; };
+        rejects = static: let c = withNet static; in
+          !(builtins.tryEval (builtins.deepSeq [ c.networking.interfaces c.networking.defaultGateway ] true)).success;
+        base = { interface = "eth0"; address = "192.168.1.50"; prefixLength = 24; gateway = "192.168.1.1"; };
+      in
+        assert ciSystem.config.services.nixpit.network.static == null;
+        assert good.networking.useDHCP == false;
+        assert good.networking.interfaces.eth0.ipv4.addresses == [ { address = "192.168.1.50"; prefixLength = 24; } ];
+        assert good.networking.defaultGateway.address == "192.168.1.1";
+        assert good.networking.nameservers == [ "1.1.1.1" ];
+        assert rejects (base // { address = "192.168.1.256"; });
+        assert rejects (base // { prefixLength = 33; });
+        assert rejects (base // { gateway = "gw"; });
+        assert rejects (base // { interface = "eth0;rm"; });
+        pkgs.runCommand "nixpit-network-static" {} "touch $out";
+
       # Verify all platform binaries, Cockpit plugins, and nixpit_virtmon.ko exist in the build.
       platform-paths = let
         config = ciSystem.config;
